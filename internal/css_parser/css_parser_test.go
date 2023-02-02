@@ -15,7 +15,7 @@ func expectParseError(t *testing.T, contents string, expected string) {
 	t.Helper()
 	t.Run(contents, func(t *testing.T) {
 		t.Helper()
-		log := logger.NewDeferLog(logger.DeferLogNoVerboseOrDebug)
+		log := logger.NewDeferLog(logger.DeferLogNoVerboseOrDebug, nil)
 		Parse(log, test.SourceForTest(contents), Options{})
 		msgs := log.Done()
 		text := ""
@@ -30,7 +30,7 @@ func expectPrintedCommon(t *testing.T, name string, contents string, expected st
 	t.Helper()
 	t.Run(name, func(t *testing.T) {
 		t.Helper()
-		log := logger.NewDeferLog(logger.DeferLogNoVerboseOrDebug)
+		log := logger.NewDeferLog(logger.DeferLogNoVerboseOrDebug, nil)
 		tree := Parse(log, test.SourceForTest(contents), Options{
 			MinifySyntax:           options.MinifySyntax,
 			MinifyWhitespace:       options.MinifyWhitespace,
@@ -273,22 +273,26 @@ func TestString(t *testing.T) {
 	expectParseError(t, "a:after { content: '\r' }",
 		`<stdin>: ERROR: Unterminated string token
 <stdin>: ERROR: Unterminated string token
-<stdin>: WARNING: Expected "}" but found end of file
+<stdin>: WARNING: Expected "}" to go with "{"
+<stdin>: NOTE: The unbalanced "{" is here:
 `)
 	expectParseError(t, "a:after { content: '\n' }",
 		`<stdin>: ERROR: Unterminated string token
 <stdin>: ERROR: Unterminated string token
-<stdin>: WARNING: Expected "}" but found end of file
+<stdin>: WARNING: Expected "}" to go with "{"
+<stdin>: NOTE: The unbalanced "{" is here:
 `)
 	expectParseError(t, "a:after { content: '\f' }",
 		`<stdin>: ERROR: Unterminated string token
 <stdin>: ERROR: Unterminated string token
-<stdin>: WARNING: Expected "}" but found end of file
+<stdin>: WARNING: Expected "}" to go with "{"
+<stdin>: NOTE: The unbalanced "{" is here:
 `)
 	expectParseError(t, "a:after { content: '\r\n' }",
 		`<stdin>: ERROR: Unterminated string token
 <stdin>: ERROR: Unterminated string token
-<stdin>: WARNING: Expected "}" but found end of file
+<stdin>: WARNING: Expected "}" to go with "{"
+<stdin>: NOTE: The unbalanced "{" is here:
 `)
 
 	expectPrinted(t, "a:after { content: '\\1010101' }", "a:after {\n  content: \"\U001010101\";\n}\n")
@@ -596,9 +600,9 @@ func TestSelector(t *testing.T) {
 	expectPrinted(t, "a[b] {}", "a[b] {\n}\n")
 	expectPrinted(t, "a [b] {}", "a [b] {\n}\n")
 	expectParseError(t, "[] {}", "<stdin>: WARNING: Expected identifier but found \"]\"\n")
-	expectParseError(t, "[b {}", "<stdin>: WARNING: Expected \"]\" but found \"{\"\n")
+	expectParseError(t, "[b {}", "<stdin>: WARNING: Expected \"]\" to go with \"[\"\n<stdin>: NOTE: The unbalanced \"[\" is here:\n")
 	expectParseError(t, "[b]] {}", "<stdin>: WARNING: Unexpected \"]\"\n")
-	expectParseError(t, "a[b {}", "<stdin>: WARNING: Expected \"]\" but found \"{\"\n")
+	expectParseError(t, "a[b {}", "<stdin>: WARNING: Expected \"]\" to go with \"[\"\n<stdin>: NOTE: The unbalanced \"[\" is here:\n")
 	expectParseError(t, "a[b]] {}", "<stdin>: WARNING: Unexpected \"]\"\n")
 
 	expectPrinted(t, "[|b]{}", "[b] {\n}\n") // "[|b]" is equivalent to "[b]"
@@ -618,7 +622,7 @@ func TestSelector(t *testing.T) {
 	expectPrinted(t, "[b$=\"c\"] {}", "[b$=c] {\n}\n")
 	expectPrinted(t, "[b*=\"c\"] {}", "[b*=c] {\n}\n")
 	expectPrinted(t, "[b|=\"c\"] {}", "[b|=c] {\n}\n")
-	expectParseError(t, "[b?=\"c\"] {}", "<stdin>: WARNING: Expected \"]\" but found \"?\"\n")
+	expectParseError(t, "[b?=\"c\"] {}", "<stdin>: WARNING: Expected \"]\" to go with \"[\"\n<stdin>: NOTE: The unbalanced \"[\" is here:\n")
 
 	expectPrinted(t, "[b = \"c\"] {}", "[b=c] {\n}\n")
 	expectPrinted(t, "[b ~= \"c\"] {}", "[b~=c] {\n}\n")
@@ -626,16 +630,16 @@ func TestSelector(t *testing.T) {
 	expectPrinted(t, "[b $= \"c\"] {}", "[b$=c] {\n}\n")
 	expectPrinted(t, "[b *= \"c\"] {}", "[b*=c] {\n}\n")
 	expectPrinted(t, "[b |= \"c\"] {}", "[b|=c] {\n}\n")
-	expectParseError(t, "[b ?= \"c\"] {}", "<stdin>: WARNING: Expected \"]\" but found \"?\"\n")
+	expectParseError(t, "[b ?= \"c\"] {}", "<stdin>: WARNING: Expected \"]\" to go with \"[\"\n<stdin>: NOTE: The unbalanced \"[\" is here:\n")
 
 	expectPrinted(t, "[b = \"c\" i] {}", "[b=c i] {\n}\n")
 	expectPrinted(t, "[b = \"c\" I] {}", "[b=c I] {\n}\n")
 	expectPrinted(t, "[b = \"c\" s] {}", "[b=c s] {\n}\n")
 	expectPrinted(t, "[b = \"c\" S] {}", "[b=c S] {\n}\n")
-	expectParseError(t, "[b i] {}", "<stdin>: WARNING: Expected \"]\" but found \"i\"\n<stdin>: WARNING: Unexpected \"]\"\n")
-	expectParseError(t, "[b I] {}", "<stdin>: WARNING: Expected \"]\" but found \"I\"\n<stdin>: WARNING: Unexpected \"]\"\n")
-	expectParseError(t, "[b s] {}", "<stdin>: WARNING: Expected \"]\" but found \"s\"\n<stdin>: WARNING: Unexpected \"]\"\n")
-	expectParseError(t, "[b S] {}", "<stdin>: WARNING: Expected \"]\" but found \"S\"\n<stdin>: WARNING: Unexpected \"]\"\n")
+	expectParseError(t, "[b i] {}", "<stdin>: WARNING: Expected \"]\" to go with \"[\"\n<stdin>: NOTE: The unbalanced \"[\" is here:\n<stdin>: WARNING: Unexpected \"]\"\n")
+	expectParseError(t, "[b I] {}", "<stdin>: WARNING: Expected \"]\" to go with \"[\"\n<stdin>: NOTE: The unbalanced \"[\" is here:\n<stdin>: WARNING: Unexpected \"]\"\n")
+	expectParseError(t, "[b s] {}", "<stdin>: WARNING: Expected \"]\" to go with \"[\"\n<stdin>: NOTE: The unbalanced \"[\" is here:\n<stdin>: WARNING: Unexpected \"]\"\n")
+	expectParseError(t, "[b S] {}", "<stdin>: WARNING: Expected \"]\" to go with \"[\"\n<stdin>: NOTE: The unbalanced \"[\" is here:\n<stdin>: WARNING: Unexpected \"]\"\n")
 
 	expectPrinted(t, "|b {}", "|b {\n}\n")
 	expectPrinted(t, "|* {}", "|* {\n}\n")
@@ -664,6 +668,11 @@ func TestSelector(t *testing.T) {
 	expectPrinted(t, "a:b:c {}", "a:b:c {\n}\n")
 	expectPrinted(t, "a:b(:c) {}", "a:b(:c) {\n}\n")
 	expectPrinted(t, "a: b {}", "a: b {\n}\n")
+
+	// These test cases previously caused a hang (see https://github.com/evanw/esbuild/issues/2276)
+	expectParseError(t, ":x(", "<stdin>: WARNING: Unexpected end of file\n")
+	expectParseError(t, ":x( {}", "<stdin>: WARNING: Expected \")\" to go with \"(\"\n<stdin>: NOTE: The unbalanced \"(\" is here:\n")
+	expectParseError(t, ":x(, :y() {}", "<stdin>: WARNING: Expected \")\" to go with \"(\"\n<stdin>: NOTE: The unbalanced \"(\" is here:\n")
 
 	expectPrinted(t, "#id {}", "#id {\n}\n")
 	expectPrinted(t, "#--0 {}", "#--0 {\n}\n")
@@ -775,6 +784,8 @@ func TestAtRule(t *testing.T) {
 	expectPrinted(t, "@-moz-document url-prefix() { h1 { color: green } }",
 		"@-moz-document url-prefix() {\n  h1 {\n    color: green;\n  }\n}\n")
 
+	expectPrinted(t, "@media foo { bar }", "@media foo {\n  bar {\n  }\n}\n")
+
 	// https://www.w3.org/TR/css-page-3/#syntax-page-selector
 	expectPrinted(t, `
 		@page :first { margin: 0 }
@@ -850,6 +861,83 @@ func TestAtRule(t *testing.T) {
   }
 }
 `)
+
+	// https://drafts.csswg.org/css-fonts-4/#font-palette-values
+	expectPrinted(t, `
+		@font-palette-values --Augusta {
+			font-family: Handover Sans;
+			base-palette: 3;
+			override-colors: 1 rgb(43, 12, 9), 2 #000, 3 var(--highlight)
+		}
+	`, `@font-palette-values --Augusta {
+  font-family: Handover Sans;
+  base-palette: 3;
+  override-colors:
+    1 rgb(43, 12, 9),
+    2 #000,
+    3 var(--highlight);
+}
+`)
+
+	// https://drafts.csswg.org/css-contain-3/#container-rule
+	expectPrinted(t, `
+		@container my-layout (inline-size > 45em) {
+			.foo {
+				color: skyblue;
+			}
+		}
+	`, `@container my-layout (inline-size > 45em) {
+  .foo {
+    color: skyblue;
+  }
+}
+`)
+	expectPrintedMinify(t, `@container card ( inline-size > 30em ) and style( --responsive = true ) {
+	.foo {
+		color: skyblue;
+	}
+}`, "@container card (inline-size > 30em) and style(--responsive = true){.foo{color:skyblue}}")
+	expectPrintedMangleMinify(t, `@supports ( container-type: size ) {
+	@container ( width <= 150px ) {
+		#inner {
+			background-color: skyblue;
+		}
+	}
+}`, "@supports (container-type: size){@container (width <= 150px){#inner{background-color:#87ceeb}}}")
+
+	// https://drafts.csswg.org/css-counter-styles/#the-counter-style-rule
+	expectPrinted(t, `
+		@counter-style box-corner {
+			system: fixed;
+			symbols: ◰ ◳ ◲ ◱;
+			suffix: ': '
+		}
+	`, `@counter-style box-corner {
+  system: fixed;
+  symbols: ◰ ◳ ◲ ◱;
+  suffix: ": ";
+}
+`)
+
+	// https://drafts.csswg.org/css-fonts/#font-feature-values
+	expectPrinted(t, `
+		@font-feature-values Roboto {
+			font-display: swap;
+		}
+	`, `@font-feature-values Roboto {
+  font-display: swap;
+}
+`)
+	expectPrinted(t, `
+		@font-feature-values Bongo {
+			@swash { ornate: 1 }
+		}
+	`, `@font-feature-values Bongo {
+  @swash {
+    ornate: 1;
+  }
+}
+`)
 }
 
 func TestAtCharset(t *testing.T) {
@@ -885,7 +973,7 @@ func TestAtImport(t *testing.T) {
 	expectParseError(t, "@import;", "<stdin>: WARNING: Expected URL token but found \";\"\n")
 	expectParseError(t, "@import ;", "<stdin>: WARNING: Expected URL token but found \";\"\n")
 	expectParseError(t, "@import \"foo.css\"", "<stdin>: WARNING: Expected \";\" but found end of file\n")
-	expectParseError(t, "@import url(\"foo.css\";", "<stdin>: WARNING: Expected \")\" but found \";\"\n")
+	expectParseError(t, "@import url(\"foo.css\";", "<stdin>: WARNING: Expected \")\" to go with \"(\"\n<stdin>: NOTE: The unbalanced \"(\" is here:\n")
 	expectParseError(t, "@import noturl(\"foo.css\");", "<stdin>: WARNING: Expected URL token but found \"noturl(\"\n")
 	expectParseError(t, "@import url(", `<stdin>: WARNING: Expected URL token but found bad URL token
 <stdin>: ERROR: Expected ")" to end URL token
@@ -923,7 +1011,8 @@ func TestLegalComment(t *testing.T) {
 }
 
 func TestAtKeyframes(t *testing.T) {
-	expectPrinted(t, "@keyframes {}", "@keyframes \"\" {\n}\n")
+	expectPrinted(t, "@keyframes {}", "@keyframes {}\n")
+	expectPrinted(t, "@keyframes 'name' {}", "@keyframes \"name\" {}\n")
 	expectPrinted(t, "@keyframes name{}", "@keyframes name {\n}\n")
 	expectPrinted(t, "@keyframes name {}", "@keyframes name {\n}\n")
 	expectPrinted(t, "@keyframes name{0%,50%{color:red}25%,75%{color:blue}}",
@@ -946,7 +1035,7 @@ func TestAtKeyframes(t *testing.T) {
 	expectPrinted(t, "@-o-keyframes name {}", "@-o-keyframes name {\n}\n")
 
 	expectParseError(t, "@keyframes {}", "<stdin>: WARNING: Expected identifier but found \"{\"\n")
-	expectParseError(t, "@keyframes 'name' {}", "<stdin>: WARNING: Expected identifier but found \"'name'\"\n")
+	expectParseError(t, "@keyframes 'name' {}", "") // This is allowed as it's technically possible to use in Firefox (but in no other browser)
 	expectParseError(t, "@keyframes name { 0% 100% {} }", "<stdin>: WARNING: Expected \",\" but found \"100%\"\n")
 	expectParseError(t, "@keyframes name { {} 0% {} }", "<stdin>: WARNING: Expected percentage but found \"{\"\n")
 	expectParseError(t, "@keyframes name { 100 {} }", "<stdin>: WARNING: Expected percentage but found \"100\"\n")
@@ -962,7 +1051,7 @@ func TestAtKeyframes(t *testing.T) {
 	expectParseError(t, "@keyframes name { 1% }", "<stdin>: WARNING: Expected \"{\" but found \"}\"\n")
 	expectParseError(t, "@keyframes name { 1%", "<stdin>: WARNING: Expected \"{\" but found end of file\n")
 	expectParseError(t, "@keyframes name { 1%,,2% {} }", "<stdin>: WARNING: Expected percentage but found \",\"\n")
-	expectParseError(t, "@keyframes name {", "<stdin>: WARNING: Expected \"}\" but found end of file\n")
+	expectParseError(t, "@keyframes name {", "<stdin>: WARNING: Expected \"}\" to go with \"{\"\n<stdin>: NOTE: The unbalanced \"{\" is here:\n")
 
 	expectPrinted(t, "@keyframes x { 1%, {} } @keyframes z { 1% {} }", "@keyframes x { 1%, {} }\n@keyframes z {\n  1% {\n  }\n}\n")
 	expectPrinted(t, "@keyframes x { .y {} } @keyframes z { 1% {} }", "@keyframes x { .y {} }\n@keyframes z {\n  1% {\n  }\n}\n")
@@ -1069,6 +1158,9 @@ func TestEmptyRule(t *testing.T) {
 	expectPrintedMangleMinify(t, "@page { color: red; @top-left {} }", "@page{color:red}")
 	expectPrintedMangleMinify(t, "@keyframes test { from {} to { color: red } }", "@keyframes test{to{color:red}}")
 	expectPrintedMangleMinify(t, "@keyframes test { from { color: red } to {} }", "@keyframes test{0%{color:red}}")
+
+	expectPrinted(t, "invalid", "invalid {\n}\n")
+	expectPrinted(t, "invalid }", "invalid } {\n}\n")
 }
 
 func TestMarginAndPaddingAndInset(t *testing.T) {
@@ -1559,19 +1651,19 @@ func TestTransform(t *testing.T) {
 		"a {\n  transform: matrix3d(1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1);\n}\n")
 	expectPrintedMangle(t,
 		"a { transform: matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1) }",
-		"a {\n  transform: scale(1);\n}\n")
+		"a {\n  transform: scaleZ(1);\n}\n")
 	expectPrintedMangle(t,
 		"a { transform: matrix3d(2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1) }",
-		"a {\n  transform: scaleX(2);\n}\n")
+		"a {\n  transform: scale3d(2, 1, 1);\n}\n")
 	expectPrintedMangle(t,
 		"a { transform: matrix3d(1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1) }",
-		"a {\n  transform: scaleY(2);\n}\n")
+		"a {\n  transform: scale3d(1, 2, 1);\n}\n")
 	expectPrintedMangle(t,
 		"a { transform: matrix3d(2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1) }",
-		"a {\n  transform: scale(2);\n}\n")
+		"a {\n  transform: scale3d(2, 2, 1);\n}\n")
 	expectPrintedMangle(t,
 		"a { transform: matrix3d(2, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1) }",
-		"a {\n  transform: scale(2, 3);\n}\n")
+		"a {\n  transform: scale3d(2, 3, 1);\n}\n")
 	expectPrintedMangle(t,
 		"a { transform: matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1) }",
 		"a {\n  transform: scaleZ(2);\n}\n")
@@ -1580,32 +1672,32 @@ func TestTransform(t *testing.T) {
 		"a {\n  transform: scale3d(1, 2, 3);\n}\n")
 	expectPrintedMangle(t,
 		"a { transform: matrix3d(2, 3, 0, 0, 4, 5, 0, 0, 0, 0, 1, 0, 6, 7, 0, 1) }",
-		"a {\n  transform: matrix(2, 3, 4, 5, 6, 7);\n}\n")
+		"a {\n  transform: matrix3d(2, 3, 0, 0, 4, 5, 0, 0, 0, 0, 1, 0, 6, 7, 0, 1);\n}\n")
 
-	expectPrintedMangle(t, "a { transform: translate3d(0, 0, 0) }", "a {\n  transform: translate(0);\n}\n")
-	expectPrintedMangle(t, "a { transform: translate3d(0%, 0%, 0) }", "a {\n  transform: translate(0);\n}\n")
-	expectPrintedMangle(t, "a { transform: translate3d(0px, 0px, 0px) }", "a {\n  transform: translate(0);\n}\n")
-	expectPrintedMangle(t, "a { transform: translate3d(1px, 0px, 0px) }", "a {\n  transform: translate(1px);\n}\n")
-	expectPrintedMangle(t, "a { transform: translate3d(0px, 1px, 0px) }", "a {\n  transform: translateY(1px);\n}\n")
+	expectPrintedMangle(t, "a { transform: translate3d(0, 0, 0) }", "a {\n  transform: translateZ(0);\n}\n")
+	expectPrintedMangle(t, "a { transform: translate3d(0%, 0%, 0) }", "a {\n  transform: translateZ(0);\n}\n")
+	expectPrintedMangle(t, "a { transform: translate3d(0px, 0px, 0px) }", "a {\n  transform: translateZ(0);\n}\n")
+	expectPrintedMangle(t, "a { transform: translate3d(1px, 0px, 0px) }", "a {\n  transform: translate3d(1px, 0, 0);\n}\n")
+	expectPrintedMangle(t, "a { transform: translate3d(0px, 1px, 0px) }", "a {\n  transform: translate3d(0, 1px, 0);\n}\n")
 	expectPrintedMangle(t, "a { transform: translate3d(0px, 0px, 1px) }", "a {\n  transform: translateZ(1px);\n}\n")
 	expectPrintedMangle(t, "a { transform: translate3d(1px, 2px, 3px) }", "a {\n  transform: translate3d(1px, 2px, 3px);\n}\n")
 	expectPrintedMangle(t, "a { transform: translate3d(1px, 0, 3px) }", "a {\n  transform: translate3d(1px, 0, 3px);\n}\n")
 	expectPrintedMangle(t, "a { transform: translate3d(0, 2px, 3px) }", "a {\n  transform: translate3d(0, 2px, 3px);\n}\n")
-	expectPrintedMangle(t, "a { transform: translate3d(1px, 2px, 0px) }", "a {\n  transform: translate(1px, 2px);\n}\n")
-	expectPrintedMangle(t, "a { transform: translate3d(40%, 60%, 0px) }", "a {\n  transform: translate(40%, 60%);\n}\n")
+	expectPrintedMangle(t, "a { transform: translate3d(1px, 2px, 0px) }", "a {\n  transform: translate3d(1px, 2px, 0);\n}\n")
+	expectPrintedMangle(t, "a { transform: translate3d(40%, 60%, 0px) }", "a {\n  transform: translate3d(40%, 60%, 0);\n}\n")
 
 	expectPrintedMangle(t, "a { transform: translateZ(0) }", "a {\n  transform: translateZ(0);\n}\n")
 	expectPrintedMangle(t, "a { transform: translateZ(0px) }", "a {\n  transform: translateZ(0);\n}\n")
 	expectPrintedMangle(t, "a { transform: translateZ(1px) }", "a {\n  transform: translateZ(1px);\n}\n")
 
-	expectPrintedMangle(t, "a { transform: scale3d(1, 1, 1) }", "a {\n  transform: scale(1);\n}\n")
-	expectPrintedMangle(t, "a { transform: scale3d(2, 1, 1) }", "a {\n  transform: scaleX(2);\n}\n")
-	expectPrintedMangle(t, "a { transform: scale3d(1, 2, 1) }", "a {\n  transform: scaleY(2);\n}\n")
+	expectPrintedMangle(t, "a { transform: scale3d(1, 1, 1) }", "a {\n  transform: scaleZ(1);\n}\n")
+	expectPrintedMangle(t, "a { transform: scale3d(2, 1, 1) }", "a {\n  transform: scale3d(2, 1, 1);\n}\n")
+	expectPrintedMangle(t, "a { transform: scale3d(1, 2, 1) }", "a {\n  transform: scale3d(1, 2, 1);\n}\n")
 	expectPrintedMangle(t, "a { transform: scale3d(1, 1, 2) }", "a {\n  transform: scaleZ(2);\n}\n")
 	expectPrintedMangle(t, "a { transform: scale3d(1, 2, 3) }", "a {\n  transform: scale3d(1, 2, 3);\n}\n")
-	expectPrintedMangle(t, "a { transform: scale3d(2, 3, 1) }", "a {\n  transform: scale(2, 3);\n}\n")
-	expectPrintedMangle(t, "a { transform: scale3d(2, 2, 1) }", "a {\n  transform: scale(2);\n}\n")
-	expectPrintedMangle(t, "a { transform: scale3d(3, 300%, 100.00%) }", "a {\n  transform: scale(3);\n}\n")
+	expectPrintedMangle(t, "a { transform: scale3d(2, 3, 1) }", "a {\n  transform: scale3d(2, 3, 1);\n}\n")
+	expectPrintedMangle(t, "a { transform: scale3d(2, 2, 1) }", "a {\n  transform: scale3d(2, 2, 1);\n}\n")
+	expectPrintedMangle(t, "a { transform: scale3d(3, 300%, 100.00%) }", "a {\n  transform: scale3d(3, 3, 1);\n}\n")
 	expectPrintedMangle(t, "a { transform: scale3d(1%, 2%, 3%) }", "a {\n  transform: scale3d(1%, 2%, 3%);\n}\n")
 
 	expectPrintedMangle(t, "a { transform: scaleZ(1) }", "a {\n  transform: scaleZ(1);\n}\n")
@@ -1619,7 +1711,7 @@ func TestTransform(t *testing.T) {
 	expectPrintedMangle(t, "a { transform: rotate3d(0, 0, 0, 45deg) }", "a {\n  transform: rotate3d(0, 0, 0, 45deg);\n}\n")
 	expectPrintedMangle(t, "a { transform: rotate3d(1, 0, 0, 45deg) }", "a {\n  transform: rotateX(45deg);\n}\n")
 	expectPrintedMangle(t, "a { transform: rotate3d(0, 1, 0, 45deg) }", "a {\n  transform: rotateY(45deg);\n}\n")
-	expectPrintedMangle(t, "a { transform: rotate3d(0, 0, 1, 45deg) }", "a {\n  transform: rotate(45deg);\n}\n")
+	expectPrintedMangle(t, "a { transform: rotate3d(0, 0, 1, 45deg) }", "a {\n  transform: rotate3d(0, 0, 1, 45deg);\n}\n")
 
 	expectPrintedMangle(t, "a { transform: rotateX(0) }", "a {\n  transform: rotateX(0);\n}\n")
 	expectPrintedMangle(t, "a { transform: rotateX(0deg) }", "a {\n  transform: rotateX(0);\n}\n")
@@ -1732,6 +1824,12 @@ func TestFontFamily(t *testing.T) {
 
 	expectPrintedMangleMinify(t, "a {font-family: 'aaa bbb', serif }", "a{font-family:aaa bbb,serif}")
 	expectPrintedMangleMinify(t, "a {font-family: 'aaa bbb', 'ccc ddd' }", "a{font-family:aaa bbb,ccc ddd}")
+	expectPrintedMangleMinify(t, "a {font-family: 'initial', serif;}", "a{font-family:\"initial\",serif}")
+	expectPrintedMangleMinify(t, "a {font-family: 'inherit', serif;}", "a{font-family:\"inherit\",serif}")
+	expectPrintedMangleMinify(t, "a {font-family: 'unset', serif;}", "a{font-family:\"unset\",serif}")
+	expectPrintedMangleMinify(t, "a {font-family: 'revert', serif;}", "a{font-family:\"revert\",serif}")
+	expectPrintedMangleMinify(t, "a {font-family: 'revert-layer', 'Segoe UI', serif;}", "a{font-family:\"revert-layer\",Segoe UI,serif}")
+	expectPrintedMangleMinify(t, "a {font-family: 'default', serif;}", "a{font-family:\"default\",serif}")
 }
 
 func TestFont(t *testing.T) {

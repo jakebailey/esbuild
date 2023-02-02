@@ -48,7 +48,7 @@ func Print(tree css_ast.AST, options Options) PrintResult {
 	p := printer{
 		options:       options,
 		importRecords: tree.ImportRecords,
-		builder:       sourcemap.MakeChunkBuilder(options.InputSourceMap, options.LineOffsetTables),
+		builder:       sourcemap.MakeChunkBuilder(options.InputSourceMap, options.LineOffsetTables, options.ASCIIOnly),
 	}
 	for _, rule := range tree.Rules {
 		p.printRule(rule, 0, false)
@@ -78,7 +78,7 @@ func (p *printer) printRule(rule css_ast.Rule, indent int32, omitTrailingSemicol
 	}
 
 	if p.options.AddSourceMappings {
-		p.builder.AddSourceMapping(rule.Loc, p.css)
+		p.builder.AddSourceMapping(rule.Loc, "", p.css)
 	}
 
 	if !p.options.MinifyWhitespace {
@@ -108,11 +108,7 @@ func (p *printer) printRule(rule css_ast.Rule, indent int32, omitTrailingSemicol
 		p.print("@")
 		p.printIdent(r.AtToken, identNormal, mayNeedWhitespaceAfter)
 		p.print(" ")
-		if r.Name == "" {
-			p.print("\"\"")
-		} else {
-			p.printIdent(r.Name, identNormal, canDiscardWhitespaceAfter)
-		}
+		p.printIdent(r.Name, identNormal, canDiscardWhitespaceAfter)
 		if !p.options.MinifyWhitespace {
 			p.print(" ")
 		}

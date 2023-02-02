@@ -1,5 +1,4 @@
 const { installForTests, removeRecursiveSync, writeFileAtomic } = require('./esbuild')
-const { SourceMapConsumer } = require('source-map')
 const assert = require('assert')
 const path = require('path')
 const http = require('http')
@@ -274,7 +273,7 @@ let buildTests = {
     assert.strictEqual(notcss, 'body {\n}\n')
   },
 
-  async sourceMap({ esbuild, testDir }) {
+  async sourceMapTrue({ esbuild, testDir }) {
     const input = path.join(testDir, 'in.js')
     const output = path.join(testDir, 'out.js')
     const content = 'exports.foo = 123'
@@ -283,6 +282,28 @@ let buildTests = {
       entryPoints: [input],
       outfile: output,
       sourcemap: true,
+    })
+    const result = require(output)
+    assert.strictEqual(result.foo, 123)
+    const outputFile = await readFileAsync(output, 'utf8')
+    const match = /\/\/# sourceMappingURL=(.*)/.exec(outputFile)
+    assert.strictEqual(match[1], 'out.js.map')
+    const resultMap = await readFileAsync(output + '.map', 'utf8')
+    const json = JSON.parse(resultMap)
+    assert.strictEqual(json.version, 3)
+    assert.strictEqual(json.sources[0], path.basename(input))
+    assert.strictEqual(json.sourcesContent[0], content)
+  },
+
+  async sourceMapLinked({ esbuild, testDir }) {
+    const input = path.join(testDir, 'in.js')
+    const output = path.join(testDir, 'out.js')
+    const content = 'exports.foo = 123'
+    await writeFileAsync(input, content)
+    await esbuild.build({
+      entryPoints: [input],
+      outfile: output,
+      sourcemap: 'linked',
     })
     const result = require(output)
     assert.strictEqual(result.foo, 123)
@@ -577,6 +598,28 @@ let buildTests = {
     assert.strictEqual(result.__esModule, true)
   },
 
+  async buildLoaderStdinBase64({ esbuild }) {
+    // UTF-16
+    var result = await esbuild.build({
+      stdin: {
+        contents: `\xFF`,
+        loader: 'base64',
+      },
+      write: false,
+    })
+    assert.strictEqual(result.outputFiles[0].text, `module.exports = "w78=";\n`)
+
+    // Binary
+    var result = await esbuild.build({
+      stdin: {
+        contents: new Uint8Array([0xFF]),
+        loader: 'base64',
+      },
+      write: false,
+    })
+    assert.strictEqual(result.outputFiles[0].text, `module.exports = "/w==";\n`)
+  },
+
   async fileLoader({ esbuild, testDir }) {
     const input = path.join(testDir, 'in.js')
     const data = path.join(testDir, 'data.bin')
@@ -690,17 +733,17 @@ let buildTests = {
     assert.deepStrictEqual(value.outputFiles.length, 3)
     assert.deepStrictEqual(value.outputFiles[0].path, path.join(outdir, 'a', 'in1.js'))
     assert.deepStrictEqual(value.outputFiles[1].path, path.join(outdir, 'b', 'in2.js'))
-    assert.deepStrictEqual(value.outputFiles[2].path, path.join(outdir, 'chunk-22JQAFLY.js'))
+    assert.deepStrictEqual(value.outputFiles[2].path, path.join(outdir, 'chunk-3MCOY2GR.js'))
     assert.deepStrictEqual(value.outputFiles[0].text, `import {
   foo
-} from "https://www.example.com/assets/chunk-22JQAFLY.js";
+} from "https://www.example.com/assets/chunk-3MCOY2GR.js";
 export {
   foo as input1
 };
 `)
     assert.deepStrictEqual(value.outputFiles[1].text, `import {
   foo
-} from "https://www.example.com/assets/chunk-22JQAFLY.js";
+} from "https://www.example.com/assets/chunk-3MCOY2GR.js";
 export {
   foo as input2
 };
@@ -714,6 +757,43 @@ export {
   foo
 };
 `)
+  },
+
+  async publicPathHashing({ esbuild, testDir }) {
+    const input = path.join(testDir, 'in.js')
+    const data = path.join(testDir, 'data.bin')
+    const outdir = path.join(testDir, 'out')
+    await writeFileAsync(input, `export {default} from ${JSON.stringify(data)}`)
+    await writeFileAsync(data, `stuff`)
+
+    const [result1, result2] = await Promise.all([
+      esbuild.build({
+        entryPoints: [input],
+        bundle: true,
+        outdir,
+        format: 'cjs',
+        loader: { '.bin': 'file' },
+        entryNames: '[name]-[hash]',
+        write: false,
+      }),
+      esbuild.build({
+        entryPoints: [input],
+        bundle: true,
+        outdir,
+        format: 'cjs',
+        loader: { '.bin': 'file' },
+        entryNames: '[name]-[hash]',
+        publicPath: 'https://www.example.com',
+        write: false,
+      }),
+    ])
+
+    const names1 = result1.outputFiles.map(x => path.basename(x.path)).sort()
+    const names2 = result2.outputFiles.map(x => path.basename(x.path)).sort()
+
+    // Check that the public path is included in chunk hashes but not asset hashes
+    assert.deepStrictEqual(names1, ['data-BYATPJRB.bin', 'in-OGEHLZ72.js'])
+    assert.deepStrictEqual(names2, ['data-BYATPJRB.bin', 'in-IF4VVJK4.js'])
   },
 
   async fileLoaderPublicPath({ esbuild, testDir }) {
@@ -1006,7 +1086,7 @@ body {
     const inEntry1 = makeInPath(entry1);
     const inEntry2 = makeInPath(entry2);
     const inImported = makeInPath(imported);
-    const chunk = 'chunk-MDV3DDWZ.js';
+    const chunk = 'chunk-ELD4XOGW.js';
     const outEntry1 = makeOutPath(path.basename(entry1));
     const outEntry2 = makeOutPath(path.basename(entry2));
     const outChunk = makeOutPath(chunk);
@@ -2563,6 +2643,621 @@ require("/assets/file.png");
     assert.strictEqual(await tryTargetESM('node14.18'), `// <stdin>\nvar import_node_fs = __toESM(require("node:fs"));\nimport("node:fs");\n(0, import_node_fs.default)();\n`)
     assert.strictEqual(await tryTargetESM('node14.17'), `// <stdin>\nvar import_node_fs = __toESM(require("fs"));\nimport("fs");\n(0, import_node_fs.default)();\n`)
   },
+
+  async zipFile({ esbuild, testDir }) {
+    const entry = path.join(testDir, 'entry.js')
+    const zip = path.join(testDir, 'test.zip')
+
+    await writeFileAsync(entry, `
+      import foo from './test.zip/foo.js'
+      import bar from './test.zip/bar/bar.js'
+
+      import __virtual__1 from './test.zip/__virtual__/ignored/0/foo.js'
+      import __virtual__2 from './test.zip/ignored/__virtual__/ignored/1/foo.js'
+      import __virtual__3 from './test.zip/__virtual__/ignored/1/test.zip/foo.js'
+
+      import $$virtual1 from './test.zip/$$virtual/ignored/0/foo.js'
+      import $$virtual2 from './test.zip/ignored/$$virtual/ignored/1/foo.js'
+      import $$virtual3 from './test.zip/$$virtual/ignored/1/test.zip/foo.js'
+
+      console.log({
+        foo,
+        bar,
+
+        __virtual__1,
+        __virtual__2,
+        __virtual__3,
+
+        $$virtual1,
+        $$virtual2,
+        $$virtual3,
+      })
+    `)
+
+    // This uses the real file system instead of the mock file system so that
+    // we can check that everything works as expected on Windows, which is not
+    // a POSIX environment.
+    await writeFileAsync(zip, Buffer.from(
+      `UEsDBAoAAgAAAG1qCFUSAXosFQAAABUAAAAGABwAZm9vLmpzVVQJAAOeRfFioEXxYnV4C` +
+      `wABBPUBAAAEFAAAAGV4cG9ydCBkZWZhdWx0ICdmb28nClBLAwQKAAIAAABzaghVwuDbLR` +
+      `UAAAAVAAAACgAcAGJhci9iYXIuanNVVAkAA6lF8WKrRfFidXgLAAEE9QEAAAQUAAAAZXh` +
+      `wb3J0IGRlZmF1bHQgJ2JhcicKUEsBAh4DCgACAAAAbWoIVRIBeiwVAAAAFQAAAAYAGAAA` +
+      `AAAAAQAAAKSBAAAAAGZvby5qc1VUBQADnkXxYnV4CwABBPUBAAAEFAAAAFBLAQIeAwoAA` +
+      `gAAAHNqCFXC4NstFQAAABUAAAAKABgAAAAAAAEAAACkgVUAAABiYXIvYmFyLmpzVVQFAA` +
+      `OpRfFidXgLAAEE9QEAAAQUAAAAUEsFBgAAAAACAAIAnAAAAK4AAAAAAA==`, 'base64'))
+
+    const value = await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      write: false,
+    })
+
+    assert.strictEqual(value.outputFiles.length, 1)
+    assert.strictEqual(value.outputFiles[0].text, `(() => {
+  // scripts/.js-api-tests/zipFile/test.zip/foo.js
+  var foo_default = "foo";
+
+  // scripts/.js-api-tests/zipFile/test.zip/bar/bar.js
+  var bar_default = "bar";
+
+  // scripts/.js-api-tests/zipFile/test.zip/__virtual__/ignored/0/foo.js
+  var foo_default2 = "foo";
+
+  // scripts/.js-api-tests/zipFile/test.zip/ignored/__virtual__/ignored/1/foo.js
+  var foo_default3 = "foo";
+
+  // scripts/.js-api-tests/zipFile/test.zip/__virtual__/ignored/1/test.zip/foo.js
+  var foo_default4 = "foo";
+
+  // scripts/.js-api-tests/zipFile/test.zip/$$virtual/ignored/0/foo.js
+  var foo_default5 = "foo";
+
+  // scripts/.js-api-tests/zipFile/test.zip/ignored/$$virtual/ignored/1/foo.js
+  var foo_default6 = "foo";
+
+  // scripts/.js-api-tests/zipFile/test.zip/$$virtual/ignored/1/test.zip/foo.js
+  var foo_default7 = "foo";
+
+  // scripts/.js-api-tests/zipFile/entry.js
+  console.log({
+    foo: foo_default,
+    bar: bar_default,
+    __virtual__1: foo_default2,
+    __virtual__2: foo_default3,
+    __virtual__3: foo_default4,
+    $$virtual1: foo_default5,
+    $$virtual2: foo_default6,
+    $$virtual3: foo_default7
+  });
+})();
+`)
+  },
+
+  async yarnPnP_pnp_data_json({ esbuild, testDir }) {
+    const entry = path.join(testDir, 'entry.js')
+    const manifest = path.join(testDir, '.pnp.data.json')
+    const leftPad = path.join(testDir, '.yarn', 'cache', 'left-pad-zip', 'node_modules', 'left-pad', 'index.js')
+
+    await writeFileAsync(entry, `
+      import leftPad from 'left-pad'
+      console.log(leftPad())
+    `)
+
+    await writeFileAsync(manifest, `{
+      "packageRegistryData": [
+        [null, [
+          [null, {
+            "packageLocation": "./",
+            "packageDependencies": [
+              ["left-pad", "npm:1.3.0"]
+            ],
+            "linkType": "SOFT"
+          }]
+        ]],
+        ["left-pad", [
+          ["npm:1.3.0", {
+            "packageLocation": "./.yarn/cache/left-pad-zip/node_modules/left-pad/",
+            "packageDependencies": [
+              ["left-pad", "npm:1.3.0"]
+            ],
+            "linkType": "HARD"
+          }]
+        ]]
+      ]
+    }`)
+
+    await mkdirAsync(path.dirname(leftPad), { recursive: true })
+    await writeFileAsync(leftPad, `export default function() {}`)
+
+    const value = await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      write: false,
+      absWorkingDir: testDir,
+    })
+
+    assert.strictEqual(value.outputFiles.length, 1)
+    assert.strictEqual(value.outputFiles[0].text, `(() => {
+  // .yarn/cache/left-pad-zip/node_modules/left-pad/index.js
+  function left_pad_default() {
+  }
+
+  // entry.js
+  console.log(left_pad_default());
+})();
+`)
+  },
+
+  async yarnPnP_pnp_js_object_literal({ esbuild, testDir }) {
+    const entry = path.join(testDir, 'entry.js')
+    const manifest = path.join(testDir, '.pnp.js')
+    const leftPad = path.join(testDir, '.yarn', 'cache', 'left-pad-zip', 'node_modules', 'left-pad', 'index.js')
+
+    await writeFileAsync(entry, `
+      import leftPad from 'left-pad'
+      console.log(leftPad())
+    `)
+
+    await writeFileAsync(manifest, `#!/usr/bin/env node
+      /* eslint-disable */
+
+      try {
+        Object.freeze({}).detectStrictMode = true;
+      } catch (error) {
+        throw new Error();
+      }
+
+      function $$SETUP_STATE(hydrateRuntimeState, basePath) {
+        return hydrateRuntimeState({
+          "packageRegistryData": [
+            [null, [
+              [null, {
+                "packageLocation": "./",
+                "packageDependencies": [
+                  ["left-pad", "npm:1.3.0"]
+                ],
+                "linkType": "SOFT"
+              }]
+            ]],
+            ["left-pad", [
+              ["npm:1.3.0", {
+                "packageLocation": "./.yarn/cache/left-pad-zip/node_modules/left-pad/",
+                "packageDependencies": [
+                  ["left-pad", "npm:1.3.0"]
+                ],
+                "linkType": "HARD"
+              }]
+            ]]
+          ]
+        })
+      }
+    `)
+
+    await mkdirAsync(path.dirname(leftPad), { recursive: true })
+    await writeFileAsync(leftPad, `export default function() {}`)
+
+    const value = await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      write: false,
+      absWorkingDir: testDir,
+    })
+
+    assert.strictEqual(value.outputFiles.length, 1)
+    assert.strictEqual(value.outputFiles[0].text, `(() => {
+  // .yarn/cache/left-pad-zip/node_modules/left-pad/index.js
+  function left_pad_default() {
+  }
+
+  // entry.js
+  console.log(left_pad_default());
+})();
+`)
+  },
+
+  async yarnPnP_pnp_cjs_JSON_parse_string_literal({ esbuild, testDir }) {
+    const entry = path.join(testDir, 'entry.js')
+    const manifest = path.join(testDir, '.pnp.cjs')
+    const leftPad = path.join(testDir, '.yarn', 'cache', 'left-pad-zip', 'node_modules', 'left-pad', 'index.js')
+
+    await writeFileAsync(entry, `
+      import leftPad from 'left-pad'
+      console.log(leftPad())
+    `)
+
+    await writeFileAsync(manifest, `#!/usr/bin/env node
+      /* eslint-disable */
+
+      try {
+        Object.freeze({}).detectStrictMode = true;
+      } catch (error) {
+        throw new Error();
+      }
+
+      function $$SETUP_STATE(hydrateRuntimeState, basePath) {
+        return hydrateRuntimeState(JSON.parse('{\\
+          "packageRegistryData": [\\
+            [null, [\\
+              [null, {\\
+                "packageLocation": "./",\\
+                "packageDependencies": [\\
+                  ["left-pad", "npm:1.3.0"]\\
+                ],\\
+                "linkType": "SOFT"\\
+              }]\\
+            ]],\\
+            ["left-pad", [\\
+              ["npm:1.3.0", {\\
+                "packageLocation": "./.yarn/cache/left-pad-zip/node_modules/left-pad/",\\
+                "packageDependencies": [\\
+                  ["left-pad", "npm:1.3.0"]\\
+                ],\\
+                "linkType": "HARD"\\
+              }]\\
+            ]]\\
+          ]\\
+        }'))
+      }
+    `)
+
+    await mkdirAsync(path.dirname(leftPad), { recursive: true })
+    await writeFileAsync(leftPad, `export default function() {}`)
+
+    const value = await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      write: false,
+      absWorkingDir: testDir,
+    })
+
+    assert.strictEqual(value.outputFiles.length, 1)
+    assert.strictEqual(value.outputFiles[0].text, `(() => {
+  // .yarn/cache/left-pad-zip/node_modules/left-pad/index.js
+  function left_pad_default() {
+  }
+
+  // entry.js
+  console.log(left_pad_default());
+})();
+`)
+  },
+
+  async yarnPnP_pnp_cjs_JSON_parse_identifier({ esbuild, testDir }) {
+    const entry = path.join(testDir, 'entry.js')
+    const manifest = path.join(testDir, '.pnp.cjs')
+    const leftPad = path.join(testDir, '.yarn', 'cache', 'left-pad-zip', 'node_modules', 'left-pad', 'index.js')
+
+    await writeFileAsync(entry, `
+      import leftPad from 'left-pad'
+      console.log(leftPad())
+    `)
+
+    await writeFileAsync(manifest, `#!/usr/bin/env node
+      /* eslint-disable */
+
+      try {
+        Object.freeze({}).detectStrictMode = true;
+      } catch (error) {
+        throw new Error();
+      }
+
+      const RAW_RUNTIME_STATE = '{\\
+        "packageRegistryData": [\\
+          [null, [\\
+            [null, {\\
+              "packageLocation": "./",\\
+              "packageDependencies": [\\
+                ["left-pad", "npm:1.3.0"]\\
+              ],\\
+              "linkType": "SOFT"\\
+            }]\\
+          ]],\\
+          ["left-pad", [\\
+            ["npm:1.3.0", {\\
+              "packageLocation": "./.yarn/cache/left-pad-zip/node_modules/left-pad/",\\
+              "packageDependencies": [\\
+                ["left-pad", "npm:1.3.0"]\\
+              ],\\
+              "linkType": "HARD"\\
+            }]\\
+          ]]\\
+        ]\\
+      }'
+
+      function $$SETUP_STATE(hydrateRuntimeState, basePath) {
+        return hydrateRuntimeState(JSON.parse(RAW_RUNTIME_STATE))
+      }
+    `)
+
+    await mkdirAsync(path.dirname(leftPad), { recursive: true })
+    await writeFileAsync(leftPad, `export default function() {}`)
+
+    const value = await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      write: false,
+      absWorkingDir: testDir,
+    })
+
+    assert.strictEqual(value.outputFiles.length, 1)
+    assert.strictEqual(value.outputFiles[0].text, `(() => {
+  // .yarn/cache/left-pad-zip/node_modules/left-pad/index.js
+  function left_pad_default() {
+  }
+
+  // entry.js
+  console.log(left_pad_default());
+})();
+`)
+  },
+
+  async yarnPnP_ignoreNestedManifests({ esbuild, testDir }) {
+    const entry = path.join(testDir, 'entry.js')
+    const foo = path.join(testDir, 'node_modules', 'foo', 'index.js')
+    const bar = path.join(testDir, 'node_modules', 'bar', 'index.js')
+    const manifest = path.join(testDir, '.pnp.data.json')
+
+    await writeFileAsync(entry, `
+      import foo from 'foo'
+      console.log(foo)
+    `)
+
+    await mkdirAsync(path.dirname(foo), { recursive: true })
+    await writeFileAsync(foo, `
+      import bar from 'bar'
+      export default 'foo' + bar
+    `)
+
+    await mkdirAsync(path.dirname(bar), { recursive: true })
+    await writeFileAsync(bar, `
+      export default 'bar'
+    `)
+
+    await writeFileAsync(manifest, `{
+      "packageRegistryData": [
+        [null, [
+          [null, {
+            "packageLocation": "./",
+            "packageDependencies": [
+              ["foo", "npm:1.0.0"],
+              ["bar", "npm:1.0.0"]
+            ],
+            "linkType": "SOFT"
+          }]
+        ]],
+        ["foo", [
+          ["npm:1.0.0", {
+            "packageLocation": "./__virtual__/whatever/0/node_modules/foo/",
+            "packageDependencies": [
+              ["bar", "npm:1.0.0"]
+            ],
+            "linkType": "HARD"
+          }]
+        ]],
+        ["bar", [
+          ["npm:1.0.0", {
+            "packageLocation": "./__virtual__/whatever/0/node_modules/bar/",
+            "packageDependencies": [],
+            "linkType": "HARD"
+          }]
+        ]]
+      ]
+    }`)
+
+    const value = await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      write: false,
+      absWorkingDir: testDir,
+    })
+
+    assert.strictEqual(value.outputFiles.length, 1)
+    assert.strictEqual(value.outputFiles[0].text, `(() => {
+  // __virtual__/whatever/0/node_modules/bar/index.js
+  var bar_default = "bar";
+
+  // __virtual__/whatever/0/node_modules/foo/index.js
+  var foo_default = "foo" + bar_default;
+
+  // entry.js
+  console.log(foo_default);
+})();
+`)
+  },
+
+  async yarnPnP_tsconfig({ esbuild, testDir }) {
+    const entry = path.join(testDir, 'entry.js')
+    const tsconfigExtends = path.join(testDir, 'tsconfig.json')
+    const tsconfigBase = path.join(testDir, 'foo', 'tsconfig.json')
+    const manifest = path.join(testDir, '.pnp.data.json')
+
+    await writeFileAsync(entry, `
+      x **= 2
+    `)
+
+    await writeFileAsync(tsconfigExtends, `{
+      "extends": "@scope/base/tsconfig.json",
+    }`)
+
+    await mkdirAsync(path.dirname(tsconfigBase), { recursive: true })
+    await writeFileAsync(tsconfigBase, `{
+      "compilerOptions": {
+        "target": "ES5"
+      }
+    }`)
+
+    await writeFileAsync(manifest, `{
+      "packageRegistryData": [
+        [null, [
+          [null, {
+            "packageLocation": "./",
+            "packageDependencies": [
+              ["@scope/base", "npm:1.0.0"]
+            ],
+            "linkType": "SOFT"
+          }]
+        ]],
+        ["@scope/base", [
+          ["npm:1.0.0", {
+            "packageLocation": "./foo/",
+            "packageDependencies": [],
+            "linkType": "HARD"
+          }]
+        ]]
+      ]
+    }`)
+
+    const value = await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      write: false,
+      absWorkingDir: testDir,
+    })
+
+    assert.strictEqual(value.outputFiles.length, 1)
+    assert.strictEqual(value.outputFiles[0].text, `(() => {
+  var __pow = Math.pow;
+
+  // entry.js
+  x = __pow(x, 2);
+})();
+`)
+  },
+
+  async yarnPnP_indexJs({ esbuild, testDir }) {
+    const entry = path.join(testDir, 'entry.js')
+    const fooIndex = path.join(testDir, 'node_modules', '@some', 'pkg', 'index.js')
+    const fooFoo = path.join(testDir, 'node_modules', '@some', 'pkg', 'foo.js')
+    const manifest = path.join(testDir, '.pnp.data.json')
+
+    await writeFileAsync(entry, `
+      import x from '@some/pkg'
+      x()
+    `)
+
+    await mkdirAsync(path.dirname(fooIndex), { recursive: true })
+    await writeFileAsync(fooIndex, `export default success`)
+
+    await mkdirAsync(path.dirname(fooFoo), { recursive: true })
+    await writeFileAsync(fooFoo, `failure!`)
+
+    await writeFileAsync(manifest, `{
+      "packageRegistryData": [
+        [null, [
+          [null, {
+            "packageLocation": "./",
+            "packageDependencies": [
+              ["@some/pkg", "npm:1.0.0"]
+            ],
+            "linkType": "SOFT"
+          }]
+        ]],
+        ["@some/pkg", [
+          ["npm:1.0.0", {
+            "packageLocation": "./node_modules/@some/pkg/",
+            "packageDependencies": [],
+            "linkType": "HARD"
+          }]
+        ]]
+      ]
+    }`)
+
+    const value = await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      write: false,
+      absWorkingDir: testDir,
+    })
+
+    assert.strictEqual(value.outputFiles.length, 1)
+    assert.strictEqual(value.outputFiles[0].text, `(() => {
+  // node_modules/@some/pkg/index.js
+  var pkg_default = success;
+
+  // entry.js
+  pkg_default();
+})();
+`)
+  },
+
+  async yarnPnP_depOfVirtual({ esbuild, testDir }) {
+    const entry = path.join(testDir, 'entry.js')
+    const pkg = path.join(testDir, '.yarn', 'cache', 'pkg-zip', 'node_modules', 'pkg', 'index.js')
+    const dep = path.join(testDir, '.yarn', 'cache', 'dep-zip', 'node_modules', 'dep', 'index.js')
+    const manifest = path.join(testDir, '.pnp.data.json')
+
+    await writeFileAsync(entry, `import 'pkg'`)
+
+    await mkdirAsync(path.dirname(pkg), { recursive: true })
+    await writeFileAsync(pkg, `import 'dep'`)
+
+    await mkdirAsync(path.dirname(dep), { recursive: true })
+    await writeFileAsync(dep, `success()`)
+
+    await writeFileAsync(manifest, `{
+      "packageRegistryData": [
+        [null, [
+          [null, {
+            "packageLocation": "./",
+            "packageDependencies": [
+              ["pkg", "virtual:some-path"]
+            ],
+            "linkType": "SOFT"
+          }]
+        ]],
+        ["demo", [
+          ["workspace:.", {
+            "packageLocation": "./",
+            "packageDependencies": [
+              ["demo", "workspace:."],
+              ["pkg", "virtual:some-path"]
+            ],
+            "linkType": "SOFT"
+          }]
+        ]],
+        ["pkg", [
+          ["npm:1.0.0", {
+            "packageLocation": "./.yarn/cache/pkg-zip/node_modules/pkg/",
+            "packageDependencies": [
+              ["pkg", "npm:1.0.0"]
+            ],
+            "linkType": "SOFT"
+          }],
+          ["virtual:some-path", {
+            "packageLocation": "./.yarn/__virtual__/pkg-virtual/0/cache/pkg-zip/node_modules/pkg/",
+            "packageDependencies": [
+              ["pkg", "virtual:some-path"],
+              ["dep", "npm:1.0.0"]
+            ],
+            "linkType": "HARD"
+          }]
+        ]],
+        ["dep", [
+          ["npm:1.0.0", {
+            "packageLocation": "./.yarn/cache/dep-zip/node_modules/dep/",
+            "packageDependencies": [
+              ["dep", "npm:1.0.0"]
+            ],
+            "linkType": "HARD"
+          }]
+        ]]
+      ]
+    }`)
+
+    const value = await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      write: false,
+      absWorkingDir: testDir,
+    })
+
+    assert.strictEqual(value.outputFiles.length, 1)
+    assert.strictEqual(value.outputFiles[0].text, `(() => {
+  // .yarn/cache/dep-zip/node_modules/dep/index.js
+  success();
+})();
+`)
+  },
 }
 
 function fetch(host, port, path, headers) {
@@ -3088,10 +3783,10 @@ async function futureSyntax(esbuild, js, targetBelow, targetAbove) {
 let transformTests = {
   async transformWithNonString({ esbuild }) {
     try {
-      await esbuild.transform(Buffer.from(`1+2`))
+      await esbuild.transform(Object.create({ toString() { return '1+2' } }))
       throw new Error('Expected an error to be thrown');
     } catch (e) {
-      assert.strictEqual(e.errors[0].text, 'The input to "transform" must be a string')
+      assert.strictEqual(e.errors ? e.errors[0].text : e + '', 'The input to "transform" must be a string or a Uint8Array')
     }
   },
 
@@ -3115,6 +3810,16 @@ let transformTests = {
         throw e;
       }
     }
+  },
+
+  async transformLoaderBase64({ esbuild }) {
+    // UTF-16
+    var result = await esbuild.transform(`\xFF`, { loader: 'base64' })
+    assert.strictEqual(result.code, `module.exports = "w78=";\n`)
+
+    // Binary
+    var result = await esbuild.transform(new Uint8Array([0xFF]), { loader: 'base64' })
+    assert.strictEqual(result.code, `module.exports = "/w==";\n`)
   },
 
   async avoidTDZ({ esbuild }) {
@@ -3188,6 +3893,14 @@ let transformTests = {
       loader: 'ts',
     })
     new Function(code)()
+  },
+
+  async mangleQuotedTransform({ esbuild }) {
+    var { code } = await esbuild.transform(`x.foo_ = 'foo_' in x`, {
+      mangleProps: /_/,
+      mangleQuoted: true,
+    })
+    assert.strictEqual(code, 'x.a = "a" in x;\n')
   },
 
   async mangleCacheTransform({ esbuild }) {
@@ -3414,17 +4127,54 @@ let transformTests = {
     assert.strictEqual(code2, `class Foo {\n  foo;\n}\n`)
   },
 
+  async tsconfigRawAlwaysStrict({ esbuild }) {
+    const input = `console.log(123)`
+
+    assert.strictEqual((await esbuild.transform(input, { loader: 'ts', tsconfigRaw: { compilerOptions: { strict: false } } })).code, `console.log(123);\n`)
+    assert.strictEqual((await esbuild.transform(input, { loader: 'ts', tsconfigRaw: { compilerOptions: { alwaysStrict: false } } })).code, `console.log(123);\n`)
+    assert.strictEqual((await esbuild.transform(input, { loader: 'ts', tsconfigRaw: { compilerOptions: { alwaysStrict: false, strict: true } } })).code, `console.log(123);\n`)
+
+    assert.strictEqual((await esbuild.transform(input, { loader: 'ts', tsconfigRaw: { compilerOptions: { strict: true } } })).code, `"use strict";\nconsole.log(123);\n`)
+    assert.strictEqual((await esbuild.transform(input, { loader: 'ts', tsconfigRaw: { compilerOptions: { alwaysStrict: true } } })).code, `"use strict";\nconsole.log(123);\n`)
+    assert.strictEqual((await esbuild.transform(input, { loader: 'ts', tsconfigRaw: { compilerOptions: { alwaysStrict: true, strict: false } } })).code, `"use strict";\nconsole.log(123);\n`)
+  },
+
+  async tsconfigRawTarget({ esbuild }) {
+    // The "target" from "tsconfig.json" should apply, but esbuild's "target" should override
+
+    assert.strictEqual((await esbuild.transform('x => x', { loader: 'ts', tsconfigRaw: { compilerOptions: { target: 'ES6' } } })).code, `(x) => x;\n`)
+    assert.strictEqual((await esbuild.transform('x => x', { loader: 'ts', tsconfigRaw: { compilerOptions: { target: 'ES5' } } })).code, `(function(x) {\n  return x;\n});\n`)
+
+    assert.strictEqual((await esbuild.transform('x => x', { loader: 'ts', target: 'es6' })).code, `(x) => x;\n`)
+    assert.strictEqual((await esbuild.transform('x => x', { loader: 'ts', target: 'es5' })).code, `(function(x) {\n  return x;\n});\n`)
+
+    assert.strictEqual((await esbuild.transform('x => x', { loader: 'ts', target: 'es5', tsconfigRaw: { compilerOptions: { target: 'ES6' } } })).code, `(function(x) {\n  return x;\n});\n`)
+    assert.strictEqual((await esbuild.transform('x => x', { loader: 'ts', target: 'es6', tsconfigRaw: { compilerOptions: { target: 'ES5' } } })).code, `(x) => x;\n`)
+  },
+
   async tsImplicitUseDefineForClassFields({ esbuild }) {
-    const { code: code1 } = await esbuild.transform(`class Foo { foo }`, {
+    var { code } = await esbuild.transform(`class Foo { foo }`, {
       loader: 'ts',
     })
-    assert.strictEqual(code1, `class Foo {\n}\n`)
+    assert.strictEqual(code, `class Foo {\n}\n`)
 
-    const { code: code2 } = await esbuild.transform(`class Foo { foo }`, {
+    var { code } = await esbuild.transform(`class Foo { foo }`, {
+      target: 'es2021',
+      loader: 'ts',
+    })
+    assert.strictEqual(code, `class Foo {\n}\n`)
+
+    var { code } = await esbuild.transform(`class Foo { foo }`, {
+      target: 'es2022',
+      loader: 'ts',
+    })
+    assert.strictEqual(code, `class Foo {\n  foo;\n}\n`)
+
+    var { code } = await esbuild.transform(`class Foo { foo }`, {
       target: 'esnext',
       loader: 'ts',
     })
-    assert.strictEqual(code2, `class Foo {\n  foo;\n}\n`)
+    assert.strictEqual(code, `class Foo {\n  foo;\n}\n`)
   },
 
   async tsconfigRawJSX({ esbuild }) {
@@ -3447,6 +4197,37 @@ let transformTests = {
       loader: 'jsx',
     })
     assert.strictEqual(code2, `/* @__PURE__ */ factory(fragment, null, /* @__PURE__ */ factory("div", null));\n`)
+
+    const { code: code3 } = await esbuild.transform(`<><div/></>`, {
+      tsconfigRaw: {
+        compilerOptions: {
+          jsx: 'react-jsx'
+        },
+      },
+      loader: 'jsx',
+    })
+    assert.strictEqual(code3, `import { Fragment, jsx } from "react/jsx-runtime";\n/* @__PURE__ */ jsx(Fragment, {\n  children: /* @__PURE__ */ jsx("div", {})\n});\n`)
+
+    const { code: code4 } = await esbuild.transform(`<><div/></>`, {
+      tsconfigRaw: {
+        compilerOptions: {
+          jsx: 'react-jsx',
+          jsxImportSource: 'notreact'
+        },
+      },
+      loader: 'jsx',
+    })
+    assert.strictEqual(code4, `import { Fragment, jsx } from "notreact/jsx-runtime";\n/* @__PURE__ */ jsx(Fragment, {\n  children: /* @__PURE__ */ jsx("div", {})\n});\n`)
+
+    const { code: code5 } = await esbuild.transform(`<><div/></>`, {
+      tsconfigRaw: {
+        compilerOptions: {
+          jsx: 'react-jsxdev'
+        },
+      },
+      loader: 'jsx',
+    })
+    assert.strictEqual(code5, `import { Fragment, jsxDEV } from "react/jsx-dev-runtime";\n/* @__PURE__ */ jsxDEV(Fragment, {\n  children: /* @__PURE__ */ jsxDEV("div", {}, void 0, false, {\n    fileName: "<stdin>",\n    lineNumber: 1,\n    columnNumber: 3\n  }, this)\n}, void 0, false, {\n  fileName: "<stdin>",\n  lineNumber: 1,\n  columnNumber: 1\n}, this);\n`)
   },
 
   // Note: tree shaking is disabled when the output format isn't IIFE
@@ -3571,6 +4352,20 @@ let transformTests = {
   async cssCharsetUTF8({ esbuild }) {
     const { code } = await esbuild.transform(`.π:after { content: 'π' }`, { loader: 'css', charset: 'utf8' })
     assert.strictEqual(code, `.π:after {\n  content: "π";\n}\n`)
+  },
+
+  async cssSyntaxErrorWarning({ esbuild }) {
+    const { code } = await esbuild.transform(`. {}`, { loader: 'css' })
+    assert.strictEqual(code, `.\\  {\n}\n`)
+  },
+
+  async cssSyntaxErrorWarningOverride({ esbuild }) {
+    try {
+      await esbuild.transform(`. {}`, { loader: 'css', logOverride: { 'css-syntax-error': 'error' } })
+      throw new Error('Expected a transform failure')
+    } catch (e) {
+      assert.strictEqual((e && e.message || e) + '', `Transform failed with 1 error:\n<stdin>:1:1: ERROR: Expected identifier but found whitespace`)
+    }
   },
 
   async cssMinify({ esbuild }) {
@@ -3736,14 +4531,34 @@ let transformTests = {
     vm.createContext(globals)
     vm.runInContext(code, globals)
     assert.strictEqual(globals.π["π 𐀀"].𐀀["𐀀 π"].default, 123)
+    assert.strictEqual(code.slice(0, code.indexOf('(() => {\n')), `var \\u03C0;
+(((\\u03C0 ||= {})["\\u03C0 \\uD800\\uDC00"] ||= {})["\\uD800\\uDC00"] ||= {})["\\uD800\\uDC00 \\u03C0"] = `)
+  },
+
+  async iifeGlobalNameUnicodeNoEscape({ esbuild }) {
+    const { code } = await esbuild.transform(`export default 123`, { format: 'iife', globalName: 'π["π 𐀀"].𐀀["𐀀 π"]', charset: 'utf8' })
+    const globals = {}
+    vm.createContext(globals)
+    vm.runInContext(code, globals)
+    assert.strictEqual(globals.π["π 𐀀"].𐀀["𐀀 π"].default, 123)
+    assert.strictEqual(code.slice(0, code.indexOf('(() => {\n')), `var π;
+(((π ||= {})["π 𐀀"] ||= {})["𐀀"] ||= {})["𐀀 π"] = `)
+  },
+
+  async iifeGlobalNameUnicodeEscapeNoLogicalAssignment({ esbuild }) {
+    const { code } = await esbuild.transform(`export default 123`, { format: 'iife', globalName: 'π["π 𐀀"].𐀀["𐀀 π"]', supported: { 'logical-assignment': false } })
+    const globals = {}
+    vm.createContext(globals)
+    vm.runInContext(code, globals)
+    assert.strictEqual(globals.π["π 𐀀"].𐀀["𐀀 π"].default, 123)
     assert.strictEqual(code.slice(0, code.indexOf('(() => {\n')), `var \\u03C0 = \\u03C0 || {};
 \\u03C0["\\u03C0 \\uD800\\uDC00"] = \\u03C0["\\u03C0 \\uD800\\uDC00"] || {};
 \\u03C0["\\u03C0 \\uD800\\uDC00"]["\\uD800\\uDC00"] = \\u03C0["\\u03C0 \\uD800\\uDC00"]["\\uD800\\uDC00"] || {};
 \\u03C0["\\u03C0 \\uD800\\uDC00"]["\\uD800\\uDC00"]["\\uD800\\uDC00 \\u03C0"] = `)
   },
 
-  async iifeGlobalNameUnicodeNoEscape({ esbuild }) {
-    const { code } = await esbuild.transform(`export default 123`, { format: 'iife', globalName: 'π["π 𐀀"].𐀀["𐀀 π"]', charset: 'utf8' })
+  async iifeGlobalNameUnicodeNoEscapeNoLogicalAssignment({ esbuild }) {
+    const { code } = await esbuild.transform(`export default 123`, { format: 'iife', globalName: 'π["π 𐀀"].𐀀["𐀀 π"]', supported: { 'logical-assignment': false }, charset: 'utf8' })
     const globals = {}
     vm.createContext(globals)
     vm.runInContext(code, globals)
@@ -3768,6 +4583,26 @@ let transformTests = {
   async jsxPreserve({ esbuild }) {
     const { code } = await esbuild.transform(`console.log(<div/>)`, { loader: 'jsx', jsx: 'preserve' })
     assert.strictEqual(code, `console.log(<div />);\n`)
+  },
+
+  async jsxRuntimeAutomatic({ esbuild }) {
+    const { code } = await esbuild.transform(`console.log(<div/>)`, { loader: 'jsx', jsx: 'automatic' })
+    assert.strictEqual(code, `import { jsx } from "react/jsx-runtime";\nconsole.log(/* @__PURE__ */ jsx("div", {}));\n`)
+  },
+
+  async jsxDev({ esbuild }) {
+    const { code } = await esbuild.transform(`console.log(<div/>)`, { loader: 'jsx', jsx: 'automatic', jsxDev: true })
+    assert.strictEqual(code, `import { jsxDEV } from "react/jsx-dev-runtime";\nconsole.log(/* @__PURE__ */ jsxDEV("div", {}, void 0, false, {\n  fileName: "<stdin>",\n  lineNumber: 1,\n  columnNumber: 13\n}, this));\n`)
+  },
+
+  async jsxImportSource({ esbuild }) {
+    const { code } = await esbuild.transform(`console.log(<div/>)`, { loader: 'jsx', jsx: 'automatic', jsxImportSource: 'notreact' })
+    assert.strictEqual(code, `import { jsx } from "notreact/jsx-runtime";\nconsole.log(/* @__PURE__ */ jsx("div", {}));\n`)
+  },
+
+  async jsxSideEffects({ esbuild }) {
+    const { code } = await esbuild.transform(`<b/>`, { loader: 'jsx', jsxSideEffects: true })
+    assert.strictEqual(code, `React.createElement("b", null);\n`)
   },
 
   async ts({ esbuild }) {
@@ -3816,20 +4651,45 @@ let transformTests = {
 
   async define({ esbuild }) {
     const define = { 'process.env.NODE_ENV': '"production"' }
-    const { code } = await esbuild.transform(`console.log(process.env.NODE_ENV)`, { define })
-    assert.strictEqual(code, `console.log("production");\n`)
+
+    const { code: code1 } = await esbuild.transform(`console.log(process.env.NODE_ENV)`, { define })
+    assert.strictEqual(code1, `console.log("production");\n`)
+
+    const { code: code2 } = await esbuild.transform(`console.log(process.env['NODE_ENV'])`, { define })
+    assert.strictEqual(code2, `console.log("production");\n`)
+
+    const { code: code3 } = await esbuild.transform(`console.log(process['env'].NODE_ENV)`, { define })
+    assert.strictEqual(code3, `console.log("production");\n`)
+
+    const { code: code4 } = await esbuild.transform(`console.log(process['env']['NODE_ENV'])`, { define })
+    assert.strictEqual(code4, `console.log("production");\n`)
   },
 
   async defineBuiltInConstants({ esbuild }) {
-    const define = { a: 'NaN', b: 'Infinity', c: 'undefined', d: 'something' }
-    const { code } = await esbuild.transform(`console.log([typeof a, typeof b, typeof c, typeof d])`, { define })
-    assert.strictEqual(code, `console.log(["number", "number", "undefined", typeof something]);\n`)
+    const define = { a: 'NaN', b: 'Infinity', c: 'undefined', d: 'something', e: 'null' }
+    const { code } = await esbuild.transform(`console.log([typeof a, typeof b, typeof c, typeof d, typeof e])`, { define })
+    assert.strictEqual(code, `console.log(["number", "number", "undefined", typeof something, "object"]);\n`)
   },
 
   async defineArray({ esbuild }) {
     const define = { 'process.env.NODE_ENV': '[1,2,3]', 'something.else': '[2,3,4]' }
     const { code } = await esbuild.transform(`console.log(process.env.NODE_ENV)`, { define })
     assert.strictEqual(code, `var define_process_env_NODE_ENV_default = [1, 2, 3];\nconsole.log(define_process_env_NODE_ENV_default);\n`)
+  },
+
+  async defineThis({ esbuild }) {
+    const { code } = await esbuild.transform(`console.log(a, b); export {}`, { define: { a: 'this', b: 'this.foo' }, format: 'esm' })
+    assert.strictEqual(code, `console.log(void 0, (void 0).foo);\n`)
+  },
+
+  async defineImportMetaESM({ esbuild }) {
+    const { code } = await esbuild.transform(`console.log(a, b); export {}`, { define: { a: 'import.meta', b: 'import.meta.foo' }, format: 'esm' })
+    assert.strictEqual(code, `console.log(import.meta, import.meta.foo);\n`)
+  },
+
+  async defineImportMetaIIFE({ esbuild }) {
+    const { code } = await esbuild.transform(`console.log(a, b); export {}`, { define: { a: 'import.meta', b: 'import.meta.foo' }, format: 'iife' })
+    assert.strictEqual(code, `(() => {\n  const import_meta = {};\n  console.log(import_meta, import_meta.foo);\n})();\n`)
   },
 
   async json({ esbuild }) {
@@ -3875,10 +4735,19 @@ let transformTests = {
     assert.strictEqual(code, `module.exports = "data:application/octet-stream;base64,AAEC";\n`)
   },
 
-  async sourceMapWithName({ esbuild }) {
+  async sourceMapTrueWithName({ esbuild }) {
     const { code, map } = await esbuild.transform(`let       x`, { sourcemap: true, sourcefile: 'afile.js' })
     assert.strictEqual(code, `let x;\n`)
     await assertSourceMap(map, 'afile.js')
+  },
+
+  async sourceMapLinkedWithName({ esbuild }) {
+    try {
+      await esbuild.transform(`let       x`, { sourcemap: 'linked', sourcefile: 'afile.js' })
+      throw new Error('Expected a transform failure')
+    } catch (e) {
+      assert.strictEqual(e + '', `Error: Transform failed with 1 error:\nerror: Cannot transform with linked source maps`)
+    }
   },
 
   async sourceMapExternalWithName({ esbuild }) {
@@ -4175,6 +5044,61 @@ let transformTests = {
     assert.strictEqual(result, 3)
   },
 
+  async singleUseExpressionSubstitution({ esbuild }) {
+    function run(code) {
+      try {
+        return JSON.stringify(new Function(code)())
+      } catch (error) {
+        return error + ''
+      }
+    }
+    let bugs = ''
+    for (let input of [
+      `let fn = () => { throw new Error }; let x = undef; return fn() + x`,
+      `let fn = () => { throw new Error }; let x = fn(); return undef + x`,
+
+      `let fn = () => arg0 = 0; let x = fn(); return arg0 + x`,
+      `let fn = () => arg0 = 0; let x = fn(); return arg0 = x`,
+      `let fn = () => arg0 = 0; let x = fn(); return arg0 += x`,
+      `let fn = () => arg0 = 0; let x = fn(); return arg0 ||= x`,
+      `let fn = () => arg0 = 0; let x = fn(); return arg0 &&= x`,
+
+      `let fn = () => arg0 = 0; let obj = [1]; let x = arg0; return obj[fn()] + x`,
+      `let fn = () => arg0 = 0; let obj = [1]; let x = arg0; return obj[fn()] = x`,
+      `let fn = () => arg0 = 0; let obj = [1]; let x = arg0; return obj[fn()] += x`,
+      `let fn = () => arg0 = 0; let obj = [1]; let x = arg0; return obj[fn()] ||= x`,
+      `let fn = () => arg0 = 0; let obj = [1]; let x = arg0; return obj[fn()] &&= x`,
+
+      `let obj = { get y() { arg0 = 0; return 1 } }; let x = obj.y; return arg0 + x`,
+      `let obj = { get y() { arg0 = 0; return 1 } }; let x = arg0; return obj.y + x`,
+
+      `let x = undef; return arg0 || x`,
+      `let x = undef; return arg0 && x`,
+      `let x = undef; return arg0 ? x : 1`,
+      `let x = undef; return arg0 ? 1 : x`,
+
+      `let fn = () => { throw new Error }; let x = fn(); return arg0 || x`,
+      `let fn = () => { throw new Error }; let x = fn(); return arg0 && x`,
+      `let fn = () => { throw new Error }; let x = fn(); return arg0 ? x : 1`,
+      `let fn = () => { throw new Error }; let x = fn(); return arg0 ? 1 : x`,
+    ]) {
+      input = `function f(arg0) { ${input} } return f(123)`
+      const { code: minified } = await esbuild.transform(input, { minify: true })
+      if (run(input) !== run(minified)) bugs += '\n  ' + input
+    }
+    if (bugs !== '') throw new Error('Single-use expression substitution bugs:' + bugs)
+  },
+
+  async platformNode({ esbuild }) {
+    const { code } = await esbuild.transform(`export let foo = 123`, { format: 'cjs', platform: 'node' })
+    assert(code.slice(code.indexOf('let foo')), `let foo = 123;
+// Annotate the CommonJS export names for ESM import in node:
+0 && (module.exports = {
+  foo
+});
+`)
+  },
+
   async dynamicImportString({ esbuild }) {
     const { code } = await esbuild.transform(`import('foo')`, { target: 'chrome63' })
     assert.strictEqual(code, `import("foo");\n`)
@@ -4289,8 +5213,78 @@ let transformTests = {
     }
   },
 
+  async supported({ esbuild }) {
+    const check = async (options, input, expected) => {
+      try {
+        assert.strictEqual((await esbuild.transform(input, options)).code, expected)
+      } catch (e) {
+        if (e.errors) assert.strictEqual(e.errors[0].text, expected)
+        else throw e
+      }
+    }
+
+    await Promise.all([
+      // JS: lower
+      check({ supported: { arrow: true } }, `x = () => y`, `x = () => y;\n`),
+      check({ supported: { arrow: false } }, `x = () => y`, `x = function() {\n  return y;\n};\n`),
+      check({ supported: { arrow: true }, target: 'es5' }, `x = () => y`, `x = () => y;\n`),
+      check({ supported: { arrow: false }, target: 'es5' }, `x = () => y`, `x = function() {\n  return y;\n};\n`),
+      check({ supported: { arrow: true }, target: 'es2022' }, `x = () => y`, `x = () => y;\n`),
+      check({ supported: { arrow: false }, target: 'es2022' }, `x = () => y`, `x = function() {\n  return y;\n};\n`),
+
+      // JS: error
+      check({ supported: { bigint: true } }, `x = 1n`, `x = 1n;\n`),
+      check({ supported: { bigint: false } }, `x = 1n`, `Big integer literals are not available in the configured target environment`),
+      check({ supported: { bigint: true }, target: 'es5' }, `x = 1n`, `x = 1n;\n`),
+      check({ supported: { bigint: false }, target: 'es5' }, `x = 1n`, `Big integer literals are not available in the configured target environment ("es5" + 1 override)`),
+      check({ supported: { bigint: true }, target: 'es2022' }, `x = 1n`, `x = 1n;\n`),
+      check({ supported: { bigint: false }, target: 'es2022' }, `x = 1n`, `Big integer literals are not available in the configured target environment ("es2022" + 1 override)`),
+
+      // CSS: lower
+      check({ supported: { 'hex-rgba': true }, loader: 'css' }, `a { color: #1234 }`, `a {\n  color: #1234;\n}\n`),
+      check({ supported: { 'hex-rgba': false }, loader: 'css' }, `a { color: #1234 }`, `a {\n  color: rgba(17, 34, 51, 0.267);\n}\n`),
+
+      // Check for "+ 2 overrides"
+      check({ supported: { bigint: false, arrow: true }, target: 'es2022' }, `x = 1n`, `Big integer literals are not available in the configured target environment ("es2022" + 2 overrides)`),
+    ])
+  },
+
+  async regExpFeatures({ esbuild }) {
+    const check = async (target, input, expected) =>
+      assert.strictEqual((await esbuild.transform(input, { target })).code, expected)
+
+    await Promise.all([
+      // RegExpStickyAndUnicodeFlags
+      check('es6', `x1 = /./y`, `x1 = /./y;\n`),
+      check('es6', `x2 = /./u`, `x2 = /./u;\n`),
+      check('es5', `x3 = /./y`, `x3 = new RegExp(".", "y");\n`),
+      check('es5', `x4 = /./u`, `x4 = new RegExp(".", "u");\n`),
+
+      // RegExpDotAllFlag
+      check('es2018', `x1 = /a.b/s`, `x1 = /a.b/s;\n`),
+      check('es2017', `x2 = /a.b/s`, `x2 = new RegExp("a.b", "s");\n`),
+
+      // RegExpLookbehindAssertions
+      check('es2018', `x1 = /(?<=x)/`, `x1 = /(?<=x)/;\n`),
+      check('es2018', `x2 = /(?<!x)/`, `x2 = /(?<!x)/;\n`),
+      check('es2017', `x3 = /(?<=x)/`, `x3 = new RegExp("(?<=x)");\n`),
+      check('es2017', `x4 = /(?<!x)/`, `x4 = new RegExp("(?<!x)");\n`),
+
+      // RegExpNamedCaptureGroups
+      check('es2018', `x1 = /(?<a>b)/`, `x1 = /(?<a>b)/;\n`),
+      check('es2017', `x2 = /(?<a>b)/`, `x2 = new RegExp("(?<a>b)");\n`),
+
+      // RegExpUnicodePropertyEscapes
+      check('es2018', `x1 = /\\p{Emoji}/u`, `x1 = /\\p{Emoji}/u;\n`),
+      check('es2017', `x2 = /\\p{Emoji}/u`, `x2 = new RegExp("\\\\p{Emoji}", "u");\n`),
+
+      // RegExpMatchIndices
+      check('es2022', `x1 = /y/d`, `x1 = /y/d;\n`),
+      check('es2021', `x2 = /y/d`, `x2 = new RegExp("y", "d");\n`),
+    ])
+  },
+
   // Future syntax
-  forAwait: ({ esbuild }) => futureSyntax(esbuild, 'async function foo() { for await (let x of y) {} }', 'es2017', 'es2018'),
   bigInt: ({ esbuild }) => futureSyntax(esbuild, '123n', 'es2019', 'es2020'),
   bigIntKey: ({ esbuild }) => futureSyntax(esbuild, '({123n: 0})', 'es2019', 'es2020'),
   bigIntPattern: ({ esbuild }) => futureSyntax(esbuild, 'let {123n: x} = y', 'es2019', 'es2020'),
@@ -4567,10 +5561,10 @@ let syncTests = {
 
   async transformSyncWithNonString({ esbuild }) {
     try {
-      esbuild.transformSync(Buffer.from(`1+2`))
+      esbuild.transformSync(Object.create({ toString() { return '1+2' } }))
       throw new Error('Expected an error to be thrown');
     } catch (e) {
-      assert.strictEqual(e.errors[0].text, 'The input to "transform" must be a string')
+      assert.strictEqual(e.errors ? e.errors[0].text : e + '', 'The input to "transform" must be a string or a Uint8Array')
     }
   },
 
@@ -4709,11 +5703,11 @@ ${path.relative(process.cwd(), input).replace(/\\/g, '/')}:1:2: ERROR: Unexpecte
 }
 
 async function assertSourceMap(jsSourceMap, source) {
-  const map = await new SourceMapConsumer(jsSourceMap)
-  const original = map.originalPositionFor({ line: 1, column: 4 })
-  assert.strictEqual(original.source, source)
-  assert.strictEqual(original.line, 1)
-  assert.strictEqual(original.column, 10)
+  jsSourceMap = JSON.parse(jsSourceMap)
+  assert.deepStrictEqual(jsSourceMap.version, 3)
+  assert.deepStrictEqual(jsSourceMap.sources, [source])
+  assert.deepStrictEqual(jsSourceMap.sourcesContent, ['let       x'])
+  assert.deepStrictEqual(jsSourceMap.mappings, 'AAAA,IAAU;')
 }
 
 async function main() {

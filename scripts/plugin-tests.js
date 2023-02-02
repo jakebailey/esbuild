@@ -1230,6 +1230,7 @@ let pluginTests = {
     } catch (e) {
       assert.deepStrictEqual(e.warnings, [])
       assert.deepStrictEqual(e.errors, [{
+        id: '',
         pluginName: '',
         text: 'Expected ";" but found "y"',
         location: {
@@ -1250,6 +1251,7 @@ let pluginTests = {
   async transformUndefinedDetailForWarning({ esbuild }) {
     const result = await esbuild.transform('typeof x == "null"')
     assert.deepStrictEqual(result.warnings, [{
+      id: 'impossible-typeof',
       pluginName: '',
       text: 'The "typeof" operator will never evaluate to "null"',
       location: {
@@ -1282,6 +1284,7 @@ let pluginTests = {
     } catch (e) {
       assert.deepStrictEqual(e.warnings, [])
       assert.deepStrictEqual(e.errors, [{
+        id: '',
         pluginName: '',
         text: 'Expected ";" but found "y"',
         location: {
@@ -1306,6 +1309,7 @@ let pluginTests = {
       logLevel: 'silent',
     })
     assert.deepStrictEqual(result.warnings, [{
+      id: 'impossible-typeof',
       pluginName: '',
       text: 'The "typeof" operator will never evaluate to "null"',
       location: {
@@ -1427,6 +1431,7 @@ let pluginTests = {
       assert.strictEqual(e.warnings.length, 0)
       assert.strictEqual(e.errors.length, 1)
       assert.deepStrictEqual(e.errors[0], {
+        id: '',
         pluginName: 'the-plugin',
         text: 'some error',
         location: {
@@ -1500,6 +1505,7 @@ let pluginTests = {
     })
     assert.strictEqual(result.warnings.length, 1)
     assert.deepStrictEqual(result.warnings[0], {
+      id: '',
       pluginName: 'other-plugin',
       text: 'some warning',
       location: {
@@ -1575,6 +1581,7 @@ let pluginTests = {
       assert.strictEqual(e.warnings.length, 0)
       assert.strictEqual(e.errors.length, 1)
       assert.deepStrictEqual(e.errors[0], {
+        id: '',
         pluginName: 'the-plugin',
         text: 'some error',
         location: {
@@ -1647,6 +1654,7 @@ let pluginTests = {
     })
     assert.strictEqual(result.warnings.length, 1)
     assert.deepStrictEqual(result.warnings[0], {
+      id: '',
       pluginName: 'the-plugin',
       text: 'some warning',
       location: {
@@ -1904,7 +1912,7 @@ let pluginTests = {
     assert.strictEqual(resolveKind, 'import-rule')
   },
 
-  async resolveKindImportStmt({ esbuild }) {
+  async resolveKindURLToken({ esbuild }) {
     let resolveKind = '<missing>'
     try {
       await esbuild.build({
@@ -2758,6 +2766,44 @@ let syncTests = {
     }
 
     result.rebuild.dispose()
+  },
+
+  async onEndCallbackMutateContents({ esbuild, testDir }) {
+    const input = path.join(testDir, 'in.js')
+    await writeFileAsync(input, `x=y`)
+
+    let onEndTimes = 0
+
+    const result = await esbuild.build({
+      entryPoints: [input],
+      write: false,
+      plugins: [
+        {
+          name: 'some-plugin',
+          setup(build) {
+            build.onEnd(result => {
+              onEndTimes++
+
+              assert.deepStrictEqual(result.outputFiles[0].contents, new Uint8Array([120, 32, 61, 32, 121, 59, 10]))
+              assert.deepStrictEqual(result.outputFiles[0].text, 'x = y;\n')
+
+              result.outputFiles[0].contents = new Uint8Array([120, 61, 121])
+              assert.deepStrictEqual(result.outputFiles[0].contents, new Uint8Array([120, 61, 121]))
+              assert.deepStrictEqual(result.outputFiles[0].text, 'x=y')
+
+              result.outputFiles[0].contents = new Uint8Array([121, 61, 120])
+              assert.deepStrictEqual(result.outputFiles[0].contents, new Uint8Array([121, 61, 120]))
+              assert.deepStrictEqual(result.outputFiles[0].text, 'y=x')
+            })
+          },
+        },
+      ],
+    })
+
+    assert.deepStrictEqual(onEndTimes, 1)
+    assert.deepStrictEqual(result.outputFiles.length, 1)
+    assert.deepStrictEqual(result.outputFiles[0].contents, new Uint8Array([121, 61, 120]))
+    assert.deepStrictEqual(result.outputFiles[0].text, 'y=x')
   },
 
   async onStartOnEndWatchMode({ esbuild, testDir }) {
