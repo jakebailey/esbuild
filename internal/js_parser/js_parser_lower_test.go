@@ -52,14 +52,41 @@ func TestLowerArrowFunction(t *testing.T) {
 }
 
 func TestLowerNullishCoalescing(t *testing.T) {
-	expectParseError(t, "a ?? b && c", "<stdin>: ERROR: Unexpected \"&&\"\n")
-	expectParseError(t, "a ?? b || c", "<stdin>: ERROR: Unexpected \"||\"\n")
-	expectParseError(t, "a ?? b && c || d", "<stdin>: ERROR: Unexpected \"&&\"\n")
-	expectParseError(t, "a ?? b || c && d", "<stdin>: ERROR: Unexpected \"||\"\n")
-	expectParseError(t, "a && b ?? c", "<stdin>: ERROR: Unexpected \"??\"\n")
-	expectParseError(t, "a || b ?? c", "<stdin>: ERROR: Unexpected \"??\"\n")
-	expectParseError(t, "a && b || c ?? c", "<stdin>: ERROR: Unexpected \"??\"\n")
-	expectParseError(t, "a || b && c ?? d", "<stdin>: ERROR: Unexpected \"??\"\n")
+	expectParseError(t, "a ?? b && c",
+		"<stdin>: ERROR: Cannot use \"&&\" with \"??\" without parentheses\n"+
+			"NOTE: Expressions of the form \"x ?? y && z\" are not allowed in JavaScript. "+
+			"You must disambiguate between \"(x ?? y) && z\" and \"x ?? (y && z)\" by adding parentheses.\n")
+	expectParseError(t, "a ?? b || c",
+		"<stdin>: ERROR: Cannot use \"||\" with \"??\" without parentheses\n"+
+			"NOTE: Expressions of the form \"x ?? y || z\" are not allowed in JavaScript. "+
+			"You must disambiguate between \"(x ?? y) || z\" and \"x ?? (y || z)\" by adding parentheses.\n")
+	expectParseError(t, "a ?? b && c || d",
+		"<stdin>: ERROR: Cannot use \"&&\" with \"??\" without parentheses\n"+
+			"NOTE: Expressions of the form \"x ?? y && z\" are not allowed in JavaScript. "+
+			"You must disambiguate between \"(x ?? y) && z\" and \"x ?? (y && z)\" by adding parentheses.\n"+
+			"<stdin>: ERROR: Cannot use \"||\" with \"??\" without parentheses\n"+
+			"NOTE: Expressions of the form \"x ?? y || z\" are not allowed in JavaScript. "+
+			"You must disambiguate between \"(x ?? y) || z\" and \"x ?? (y || z)\" by adding parentheses.\n")
+	expectParseError(t, "a ?? b || c && d",
+		"<stdin>: ERROR: Cannot use \"||\" with \"??\" without parentheses\n"+
+			"NOTE: Expressions of the form \"x ?? y || z\" are not allowed in JavaScript. "+
+			"You must disambiguate between \"(x ?? y) || z\" and \"x ?? (y || z)\" by adding parentheses.\n")
+	expectParseError(t, "a && b ?? c",
+		"<stdin>: ERROR: Cannot use \"??\" with \"&&\" without parentheses\n"+
+			"NOTE: Expressions of the form \"x && y ?? z\" are not allowed in JavaScript. "+
+			"You must disambiguate between \"(x && y) ?? z\" and \"x && (y ?? z)\" by adding parentheses.\n")
+	expectParseError(t, "a || b ?? c",
+		"<stdin>: ERROR: Cannot use \"??\" with \"||\" without parentheses\n"+
+			"NOTE: Expressions of the form \"x || y ?? z\" are not allowed in JavaScript. "+
+			"You must disambiguate between \"(x || y) ?? z\" and \"x || (y ?? z)\" by adding parentheses.\n")
+	expectParseError(t, "a && b || c ?? c",
+		"<stdin>: ERROR: Cannot use \"??\" with \"||\" without parentheses\n"+
+			"NOTE: Expressions of the form \"x || y ?? z\" are not allowed in JavaScript. "+
+			"You must disambiguate between \"(x || y) ?? z\" and \"x || (y ?? z)\" by adding parentheses.\n")
+	expectParseError(t, "a || b && c ?? d",
+		"<stdin>: ERROR: Cannot use \"??\" with \"||\" without parentheses\n"+
+			"NOTE: Expressions of the form \"x || y ?? z\" are not allowed in JavaScript. "+
+			"You must disambiguate between \"(x || y) ?? z\" and \"x || (y ?? z)\" by adding parentheses.\n")
 	expectPrinted(t, "a ?? b, b && c", "a ?? b, b && c;\n")
 	expectPrinted(t, "a ?? b, b || c", "a ?? b, b || c;\n")
 	expectPrinted(t, "a && b, b ?? c", "a && b, b ?? c;\n")
@@ -651,6 +678,10 @@ func TestLowerOptionalChain(t *testing.T) {
   }
 }
 `)
+
+	expectPrintedTarget(t, 2020, "(x?.y)``", "(x?.y)``;\n")
+	expectPrintedTarget(t, 2019, "(x?.y)``", "var _a;\n(x == null ? void 0 : x.y).call(x, _a || (_a = __template([\"\"])));\n")
+	expectPrintedTarget(t, 5, "(x?.y)``", "var _a;\n(x == null ? void 0 : x.y).call(x, _a || (_a = __template([\"\"])));\n")
 }
 
 func TestLowerOptionalCatchBinding(t *testing.T) {
@@ -705,4 +736,9 @@ func TestForAwait(t *testing.T) {
 	// Can't use for-await at the top-level without top-level await
 	err = "<stdin>: ERROR: Top-level await is not available in the configured target environment\n"
 	expectParseErrorWithUnsupportedFeatures(t, compat.TopLevelAwait, "for await (x of y) ;", err)
+	expectParseErrorWithUnsupportedFeatures(t, compat.TopLevelAwait, "if (true) for await (x of y) ;", err)
+	expectPrintedWithUnsupportedFeatures(t, compat.TopLevelAwait, "if (false) for await (x of y) ;", "if (false)\n  for (x of y)\n    ;\n")
+	expectParseErrorWithUnsupportedFeatures(t, compat.TopLevelAwait, "with (x) y; if (false) for await (x of y) ;",
+		"<stdin>: ERROR: With statements cannot be used in an ECMAScript module\n"+
+			"<stdin>: NOTE: This file is considered to be an ECMAScript module because of the top-level \"await\" keyword here:\n")
 }

@@ -1,7 +1,10 @@
 const { installForTests, removeRecursiveSync, writeFileAtomic } = require('./esbuild')
+const child_process = require('child_process')
 const assert = require('assert')
 const path = require('path')
 const http = require('http')
+const https = require('https')
+const events = require('events')
 const fs = require('fs')
 const vm = require('vm')
 
@@ -57,6 +60,36 @@ let buildTests = {
         e.errors[0].notes[0].text !== 'It looks like you are trying to use glob syntax (i.e. "*") with esbuild. ' +
         'This syntax is typically handled by your shell, and isn\'t handled by esbuild itself. ' +
         'You must expand glob syntax first before passing your paths to esbuild.') {
+        throw e;
+      }
+    }
+  },
+
+  // Verify that it's possible to disable a loader by setting it to "default".
+  // In particular, verify that it's possible to disable the special loader ""
+  // for extensionless files.
+  async errorIfExtensionlessLoaderIsDisabled({ esbuild, testDir }) {
+    let entry = path.join(testDir, 'entry.js');
+    let what = path.join(testDir, 'what');
+    await writeFileAsync(entry, 'import "./what"')
+    await writeFileAsync(what, 'foo()')
+    await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      write: false,
+    })
+    try {
+      await esbuild.build({
+        entryPoints: [entry],
+        bundle: true,
+        write: false,
+        logLevel: 'silent',
+        loader: { '': 'default' },
+      })
+      throw new Error('Expected build failure');
+    } catch (e) {
+      const relPath = path.relative(process.cwd(), what).split(path.sep).join('/')
+      if (!e.errors || !e.errors[0] || e.errors[0].text !== 'Do not know how to load path: ' + relPath) {
         throw e;
       }
     }
@@ -126,6 +159,50 @@ let buildTests = {
 
     assert.strictEqual(require(aOut).x, true)
     assert.strictEqual(require(bOut).y, true)
+  },
+
+  async aliasValidity({ esbuild }) {
+    const valid = async alias => {
+      const result = await esbuild.build({
+        stdin: { contents: 'import ' + JSON.stringify(alias) },
+        bundle: true,
+        alias: { [alias]: 'foo' },
+        external: ['foo'],
+        format: 'esm',
+        write: false,
+      })
+      assert.strictEqual(result.outputFiles[0].text, '// <stdin>\nimport "foo";\n')
+    }
+
+    const invalid = async alias => {
+      try {
+        await esbuild.build({
+          bundle: true,
+          alias: { [alias]: 'foo' },
+          logLevel: 'silent',
+        })
+      } catch {
+        return
+      }
+      throw new Error('Expected an error for alias: ' + alias)
+    }
+
+    await Promise.all([
+      valid('foo'),
+      valid('foo/bar'),
+      valid('@foo'),
+      valid('@foo/bar'),
+      valid('@foo/bar/baz'),
+
+      invalid('./foo'),
+      invalid('../foo'),
+      invalid('/foo'),
+      invalid('C:\\foo'),
+      invalid('.foo'),
+      invalid('foo/'),
+      invalid('@foo/'),
+      invalid('foo/../bar'),
+    ])
   },
 
   async pathResolverEACCS({ esbuild, testDir }) {
@@ -470,10 +547,33 @@ let buildTests = {
     const resultMap = await readFileAsync(output + '.map', 'utf8')
     const json = JSON.parse(resultMap)
     assert.strictEqual(json.version, 3)
-    assert.strictEqual(json.sources[0], 'disabled')
-    assert.strictEqual(json.sources[1], path.basename(input))
-    assert.strictEqual(json.sourcesContent[0], '')
-    assert.strictEqual(json.sourcesContent[1], content)
+    assert.strictEqual(json.sources.length, 1)
+    assert.strictEqual(json.sources[0], path.basename(input))
+    assert.strictEqual(json.sourcesContent[0], content)
+  },
+
+  async sourceMapWithEmptyFile({ esbuild, testDir }) {
+    const input = path.join(testDir, 'in.js')
+    const empty = path.join(testDir, 'file.empty')
+    const output = path.join(testDir, 'out.js')
+    const content = 'exports.foo = require("./file.empty")'
+    await writeFileAsync(input, content)
+    await writeFileAsync(empty, 'module.exports = 123')
+    await esbuild.build({
+      entryPoints: [input],
+      outfile: output,
+      sourcemap: true,
+      bundle: true,
+      loader: { '.empty': 'empty' },
+    })
+    const result = require(output)
+    assert.strictEqual(result.foo, void 0)
+    const resultMap = await readFileAsync(output + '.map', 'utf8')
+    const json = JSON.parse(resultMap)
+    assert.strictEqual(json.version, 3)
+    assert.strictEqual(json.sources.length, 1)
+    assert.strictEqual(json.sources[0], path.basename(input))
+    assert.strictEqual(json.sourcesContent[0], content)
   },
 
   async sourceMapWithDisabledModule({ esbuild, testDir }) {
@@ -497,10 +597,9 @@ let buildTests = {
     const resultMap = await readFileAsync(output + '.map', 'utf8')
     const json = JSON.parse(resultMap)
     assert.strictEqual(json.version, 3)
-    assert.strictEqual(json.sources[0], path.relative(testDir, disabled).split(path.sep).join('/'))
-    assert.strictEqual(json.sources[1], path.basename(input))
-    assert.strictEqual(json.sourcesContent[0], '')
-    assert.strictEqual(json.sourcesContent[1], content)
+    assert.strictEqual(json.sources.length, 1)
+    assert.strictEqual(json.sources[0], path.basename(input))
+    assert.strictEqual(json.sourcesContent[0], content)
   },
 
   async resolveExtensionOrder({ esbuild, testDir }) {
@@ -555,6 +654,38 @@ let buildTests = {
       inject: [inject],
     })
     assert.strictEqual(require(output).default, 1234)
+  },
+
+  async minifyWithoutInject({ esbuild, testDir }) {
+    const input = path.join(testDir, 'in.js');
+    const output = path.join(testDir, 'out.js')
+    await writeFileAsync(input, 'function exampleFn() { return Math.min(4, 3) }')
+
+    const result = await esbuild.build({
+      entryPoints: [input],
+      outfile: output,
+      write: false,
+      minify: true,
+    })
+    assert.strictEqual(3, new Function(result.outputFiles[0].text + '\nreturn exampleFn()')())
+  },
+
+  // This should be the same as "minifyWithoutInject" above
+  async minifyWithInject({ esbuild, testDir }) {
+    const input = path.join(testDir, 'in.js');
+    const inject = path.join(testDir, 'inject.js')
+    const output = path.join(testDir, 'out.js')
+    await writeFileAsync(input, 'function exampleFn() { return Math.min(4, 3) }')
+    await writeFileAsync(inject, 'let min = Math.min; export { min as "Math.min" }')
+
+    const result = await esbuild.build({
+      entryPoints: [input],
+      outfile: output,
+      inject: [inject],
+      write: false,
+      minify: true,
+    })
+    assert.strictEqual(3, new Function(result.outputFiles[0].text + '\nreturn exampleFn()')())
   },
 
   async mainFields({ esbuild, testDir }) {
@@ -947,9 +1078,9 @@ body {
     // Check inputs
     assert.deepStrictEqual(json.inputs[makePath(entry)].bytes, 144)
     assert.deepStrictEqual(json.inputs[makePath(entry)].imports, [
-      { path: makePath(imported), kind: 'import-statement' },
-      { path: makePath(css), kind: 'import-statement' },
-      { path: makePath(text), kind: 'require-call' },
+      { path: makePath(imported), kind: 'import-statement', original: './imported' },
+      { path: makePath(css), kind: 'import-statement', original: './example.css' },
+      { path: makePath(text), kind: 'require-call', original: './text.txt' },
     ])
     assert.deepStrictEqual(json.inputs[makePath(imported)].bytes, 18)
     assert.deepStrictEqual(json.inputs[makePath(imported)].imports, [])
@@ -1027,9 +1158,21 @@ body {
     const outEntry2 = makeOutPath(path.basename(entry2));
     const outChunk = makeOutPath(chunk);
 
-    assert.deepStrictEqual(json.inputs[inEntry1], { bytes: 94, imports: [{ path: inImported, kind: 'import-statement' }] })
-    assert.deepStrictEqual(json.inputs[inEntry2], { bytes: 107, imports: [{ path: inImported, kind: 'import-statement' }] })
-    assert.deepStrictEqual(json.inputs[inImported], { bytes: 118, imports: [] })
+    assert.deepStrictEqual(json.inputs[inEntry1], {
+      bytes: 94,
+      imports: [{ path: inImported, kind: 'import-statement', original: './' + path.basename(imported) }],
+      format: 'esm',
+    })
+    assert.deepStrictEqual(json.inputs[inEntry2], {
+      bytes: 107,
+      imports: [{ path: inImported, kind: 'import-statement', original: './' + path.basename(imported) }],
+      format: 'esm',
+    })
+    assert.deepStrictEqual(json.inputs[inImported], {
+      bytes: 118,
+      imports: [],
+      format: 'esm',
+    })
 
     assert.deepStrictEqual(json.outputs[outEntry1].imports, [{ path: makeOutPath(chunk), kind: 'import-statement' }])
     assert.deepStrictEqual(json.outputs[outEntry2].imports, [{ path: makeOutPath(chunk), kind: 'import-statement' }])
@@ -1091,9 +1234,21 @@ body {
     const outEntry2 = makeOutPath(path.basename(entry2));
     const outChunk = makeOutPath(chunk);
 
-    assert.deepStrictEqual(json.inputs[inEntry1], { bytes: 94, imports: [{ path: inImported, kind: 'import-statement' }] })
-    assert.deepStrictEqual(json.inputs[inEntry2], { bytes: 107, imports: [{ path: inImported, kind: 'import-statement' }] })
-    assert.deepStrictEqual(json.inputs[inImported], { bytes: 118, imports: [] })
+    assert.deepStrictEqual(json.inputs[inEntry1], {
+      bytes: 94,
+      imports: [{ path: inImported, kind: 'import-statement', original: './' + path.basename(imported) }],
+      format: 'esm',
+    })
+    assert.deepStrictEqual(json.inputs[inEntry2], {
+      bytes: 107,
+      imports: [{ path: inImported, kind: 'import-statement', original: './' + path.basename(imported) }],
+      format: 'esm',
+    })
+    assert.deepStrictEqual(json.inputs[inImported], {
+      bytes: 118,
+      imports: [],
+      format: 'esm',
+    })
 
     assert.deepStrictEqual(json.outputs[outEntry1].imports, [{ path: makeOutPath(chunk), kind: 'import-statement' }])
     assert.deepStrictEqual(json.outputs[outEntry2].imports, [{ path: makeOutPath(chunk), kind: 'import-statement' }])
@@ -1115,18 +1270,18 @@ body {
     const import2 = path.join(importDir, 'import2.js')
     const shared = path.join(testDir, 'shared.js')
     const outdir = path.join(testDir, 'out')
-    const makeImportPath = (importing, imported) => JSON.stringify('./' + path.relative(path.dirname(importing), imported).split(path.sep).join('/'))
+    const makeImportPath = (importing, imported) => './' + path.relative(path.dirname(importing), imported).split(path.sep).join('/')
     await mkdirAsync(importDir)
     await writeFileAsync(entry, `
-      import ${makeImportPath(entry, shared)}
-      import(${makeImportPath(entry, import1)})
-      import(${makeImportPath(entry, import2)})
+      import ${JSON.stringify(makeImportPath(entry, shared))}
+      import(${JSON.stringify(makeImportPath(entry, import1))})
+      import(${JSON.stringify(makeImportPath(entry, import2))})
     `)
     await writeFileAsync(import1, `
-      import ${makeImportPath(import1, shared)}
+      import ${JSON.stringify(makeImportPath(import1, shared))}
     `)
     await writeFileAsync(import2, `
-      import ${makeImportPath(import2, shared)}
+      import ${JSON.stringify(makeImportPath(import2, shared))}
     `)
     await writeFileAsync(shared, `
       console.log('side effect')
@@ -1161,22 +1316,25 @@ body {
     assert.deepStrictEqual(json.inputs[inEntry], {
       bytes: 112,
       imports: [
-        { path: inShared, kind: 'import-statement' },
-        { path: inImport1, kind: 'dynamic-import' },
-        { path: inImport2, kind: 'dynamic-import' },
-      ]
+        { path: inShared, kind: 'import-statement', original: makeImportPath(entry, shared) },
+        { path: inImport1, kind: 'dynamic-import', original: makeImportPath(entry, import1) },
+        { path: inImport2, kind: 'dynamic-import', original: makeImportPath(entry, import2) },
+      ],
+      format: 'esm',
     })
     assert.deepStrictEqual(json.inputs[inImport1], {
       bytes: 35,
       imports: [
-        { path: inShared, kind: 'import-statement' },
-      ]
+        { path: inShared, kind: 'import-statement', original: makeImportPath(import1, shared) },
+      ],
+      format: 'esm',
     })
     assert.deepStrictEqual(json.inputs[inImport2], {
       bytes: 35,
       imports: [
-        { path: inShared, kind: 'import-statement' },
-      ]
+        { path: inShared, kind: 'import-statement', original: makeImportPath(import2, shared) },
+      ],
+      format: 'esm',
     })
     assert.deepStrictEqual(json.inputs[inShared], { bytes: 38, imports: [] })
 
@@ -1188,9 +1346,9 @@ body {
     ])
 
     assert.deepStrictEqual(json.outputs[outEntry].imports, [
+      { path: outChunk, kind: 'import-statement' },
       { path: outImport1, kind: 'dynamic-import' },
       { path: outImport2, kind: 'dynamic-import' },
-      { path: outChunk, kind: 'import-statement' },
     ])
     assert.deepStrictEqual(json.outputs[outImport1].imports, [{ path: outChunk, kind: 'import-statement' }])
     assert.deepStrictEqual(json.outputs[outImport2].imports, [{ path: outChunk, kind: 'import-statement' }])
@@ -1201,7 +1359,7 @@ body {
     assert.deepStrictEqual(json.outputs[outImport2].exports, [])
     assert.deepStrictEqual(json.outputs[outChunk].exports, [])
 
-    assert.deepStrictEqual(json.outputs[outEntry].inputs, { [inEntry]: { bytesInOutput: 74 } })
+    assert.deepStrictEqual(json.outputs[outEntry].inputs, { [inEntry]: { bytesInOutput: 66 } })
     assert.deepStrictEqual(json.outputs[outImport1].inputs, { [inImport1]: { bytesInOutput: 0 } })
     assert.deepStrictEqual(json.outputs[outImport2].inputs, { [inImport2]: { bytesInOutput: 0 } })
     assert.deepStrictEqual(json.outputs[outChunk].inputs, { [inShared]: { bytesInOutput: 28 } })
@@ -1350,11 +1508,11 @@ body {
     const makePath = pathname => path.relative(cwd, pathname).split(path.sep).join('/')
     const json = result.metafile
     assert.deepStrictEqual(json.inputs[makePath(entry)].imports, [
-      { path: makePath(nested1), kind: 'import-statement' },
-      { path: makePath(nested2), kind: 'import-statement' },
+      { path: makePath(nested1), kind: 'import-statement', original: nested1 },
+      { path: makePath(nested2), kind: 'import-statement', original: nested2 },
     ])
     assert.deepStrictEqual(json.inputs[makePath(nested1)].imports, [
-      { path: makePath(nested3), kind: 'import-statement' },
+      { path: makePath(nested3), kind: 'import-statement', original: nested3 },
     ])
     assert.deepStrictEqual(json.inputs[makePath(nested2)].imports, [])
     assert.deepStrictEqual(json.inputs[makePath(nested3)].imports, [])
@@ -1394,18 +1552,27 @@ body {
     // Check inputs
     assert.deepStrictEqual(json, {
       inputs: {
-        [makePath(entry)]: { bytes: 98, imports: [{ path: makePath(imported), kind: 'import-rule' }] },
+        [makePath(entry)]: {
+          bytes: 98,
+          imports: [
+            { path: makePath(imported), kind: 'import-rule', original: './imported' },
+            { external: true, kind: 'url-token', path: 'https://example.com/external.png' },
+          ]
+        },
         [makePath(image)]: { bytes: 8, imports: [] },
-        [makePath(imported)]: { bytes: 48, imports: [{ path: makePath(image), kind: 'url-token' }] },
+        [makePath(imported)]: { bytes: 48, imports: [{ path: makePath(image), kind: 'url-token', original: './example.png' }] },
       },
       outputs: {
         [makePath(output)]: {
-          bytes: 263,
+          bytes: 253,
           entryPoint: makePath(entry),
-          imports: [],
+          imports: [
+            { kind: 'url-token', path: 'data:image/png,an image' },
+            { external: true, kind: 'url-token', path: 'https://example.com/external.png' },
+          ],
           inputs: {
             [makePath(entry)]: { bytesInOutput: 62 },
-            [makePath(imported)]: { bytesInOutput: 61 },
+            [makePath(imported)]: { bytesInOutput: 51 },
           },
         },
         [makePath(output + '.map')]: {
@@ -2176,6 +2343,38 @@ require("/assets/file.png");
 `)
   },
 
+  async externalPackages({ esbuild, testDir }) {
+    const input = path.join(testDir, 'in.js')
+    const pkgPath = path.join(testDir, 'node_modules', 'pkg', 'path.js')
+    const dirPath = path.join(testDir, 'dir', 'path.js')
+    await mkdirAsync(path.dirname(pkgPath), { recursive: true })
+    await mkdirAsync(path.dirname(dirPath), { recursive: true })
+    await writeFileAsync(input, `
+      import 'pkg/path.js'
+      import './dir/path.js'
+      import 'before/alias'
+    `)
+    await writeFileAsync(pkgPath, `console.log('pkg')`)
+    await writeFileAsync(dirPath, `console.log('dir')`)
+    const { outputFiles } = await esbuild.build({
+      entryPoints: [input],
+      write: false,
+      bundle: true,
+      packages: 'external',
+      format: 'esm',
+      alias: { 'before': 'after' },
+    })
+    assert.strictEqual(outputFiles[0].text, `// scripts/.js-api-tests/externalPackages/in.js
+import "pkg/path.js";
+
+// scripts/.js-api-tests/externalPackages/dir/path.js
+console.log("dir");
+
+// scripts/.js-api-tests/externalPackages/in.js
+import "after/alias";
+`)
+  },
+
   async errorInvalidExternalWithTwoWildcards({ esbuild }) {
     try {
       await esbuild.build({
@@ -2262,57 +2461,104 @@ require("/assets/file.png");
     assert.strictEqual(result.outputFiles[0].text, 'const x = 1;\n')
   },
 
-  async noRebuild({ esbuild, testDir }) {
-    const input = path.join(testDir, 'in.js')
-    const output = path.join(testDir, 'out.js')
-    await writeFileAsync(input, `console.log('abc')`)
-    const result1 = await esbuild.build({
-      entryPoints: [input],
-      outfile: output,
-      format: 'esm',
-      incremental: false,
-    })
-    assert.strictEqual(result1.outputFiles, void 0)
-    assert.strictEqual(await readFileAsync(output, 'utf8'), `console.log("abc");\n`)
-    assert.strictEqual(result1.rebuild, void 0)
-  },
-
   async rebuildBasic({ esbuild, testDir }) {
     const input = path.join(testDir, 'in.js')
     const output = path.join(testDir, 'out.js')
-
-    // Build 1
-    await writeFileAsync(input, `console.log('abc')`)
-    const result1 = await esbuild.build({
+    const context = await esbuild.context({
       entryPoints: [input],
       outfile: output,
       format: 'esm',
-      incremental: true,
-    })
+    });
+
+    // Build 1
+    await writeFileAsync(input, `console.log('abc')`)
+    const result1 = await context.rebuild();
     assert.strictEqual(result1.outputFiles, void 0)
     assert.strictEqual(await readFileAsync(output, 'utf8'), `console.log("abc");\n`)
 
     // Build 2
     await writeFileAsync(input, `console.log('xyz')`)
-    const result2 = await result1.rebuild();
-    assert.strictEqual(result2.rebuild, result1.rebuild)
+    const result2 = await context.rebuild();
     assert.strictEqual(result2.outputFiles, void 0)
     assert.strictEqual(await readFileAsync(output, 'utf8'), `console.log("xyz");\n`)
 
     // Build 3
     await writeFileAsync(input, `console.log(123)`)
-    const result3 = await result1.rebuild();
-    assert.strictEqual(result3.rebuild, result1.rebuild)
+    const result3 = await context.rebuild();
     assert.strictEqual(result3.outputFiles, void 0)
     assert.strictEqual(await readFileAsync(output, 'utf8'), `console.log(123);\n`)
 
     // Further rebuilds should not be possible after a dispose
-    result1.rebuild.dispose()
+    context.dispose()
     try {
-      await result1.rebuild()
+      await context.rebuild()
       throw new Error('Expected an error to be thrown')
     } catch (e) {
       assert.strictEqual(e.message, 'Cannot rebuild')
+    }
+  },
+
+  async rebuildMerging({ esbuild, testDir }) {
+    const input = path.join(testDir, 'in.js')
+    const output = path.join(testDir, 'out.js')
+    await writeFileAsync(input, `console.log(123)`)
+
+    let resolveWait
+    let waitPromise = new Promise(resolve => {
+      resolveWait = resolve
+    })
+    const waitPlugin = {
+      name: 'wait-plugin',
+      setup(build) {
+        build.onStart(() => waitPromise)
+      },
+    }
+
+    const context = await esbuild.context({
+      entryPoints: [input],
+      outfile: output,
+      format: 'esm',
+      plugins: [waitPlugin],
+      write: false,
+    });
+
+    try {
+      // Do two rebuilds
+      const rebuild1 = context.rebuild()
+      const rebuild2 = context.rebuild()
+
+      // Let the build end
+      resolveWait()
+
+      // Get both rebuild results
+      const result1 = await rebuild1;
+      const result2 = await rebuild2;
+      assert.strictEqual(result1, result2)
+      assert.strictEqual(result1.outputFiles.length, 1)
+      assert.strictEqual(result1.outputFiles[0].text, 'console.log(123);\n')
+
+      // Make an edit
+      await writeFileAsync(input, `console.log(234)`)
+
+      // Do two more rebuilds
+      waitPromise = new Promise(resolve => {
+        resolveWait = resolve
+      })
+      const rebuild3 = context.rebuild()
+      const rebuild4 = context.rebuild()
+
+      // Let the build end
+      resolveWait()
+
+      // Get both rebuild results
+      const result3 = await rebuild3;
+      const result4 = await rebuild4;
+      assert.strictEqual(result3, result4)
+      assert.notStrictEqual(result3, result1)
+      assert.strictEqual(result3.outputFiles.length, 1)
+      assert.strictEqual(result3.outputFiles[0].text, 'console.log(234);\n')
+    } finally {
+      await context.dispose()
     }
   },
 
@@ -2321,23 +2567,23 @@ require("/assets/file.png");
     const inputB = path.join(testDir, 'in-b.js')
     const outputA = path.join(testDir, 'out-a.js')
     const outputB = path.join(testDir, 'out-b.js')
+    const contextA = await esbuild.context({
+      entryPoints: [inputA],
+      outfile: outputA,
+      format: 'esm',
+    })
+    const contextB = await esbuild.context({
+      entryPoints: [inputB],
+      outfile: outputB,
+      format: 'esm',
+    })
 
     // Build 1
     await writeFileAsync(inputA, `console.log('a')`)
     await writeFileAsync(inputB, `console.log('b')`)
-    const resultA1 = await esbuild.build({
-      entryPoints: [inputA],
-      outfile: outputA,
-      format: 'esm',
-      incremental: true,
-    })
-    const resultB1 = await esbuild.build({
-      entryPoints: [inputB],
-      outfile: outputB,
-      format: 'esm',
-      incremental: true,
-    })
-    assert.notStrictEqual(resultA1.rebuild, resultB1.rebuild)
+    assert.notStrictEqual(contextA.rebuild, contextB.rebuild)
+    const resultA1 = await contextA.rebuild()
+    const resultB1 = await contextB.rebuild()
     assert.strictEqual(resultA1.outputFiles, void 0)
     assert.strictEqual(resultB1.outputFiles, void 0)
     assert.strictEqual(await readFileAsync(outputA, 'utf8'), `console.log("a");\n`)
@@ -2346,38 +2592,35 @@ require("/assets/file.png");
     // Build 2
     await writeFileAsync(inputA, `console.log(1)`)
     await writeFileAsync(inputB, `console.log(2)`)
-    const promiseA = resultA1.rebuild();
-    const promiseB = resultB1.rebuild();
+    const promiseA = contextA.rebuild();
+    const promiseB = contextB.rebuild();
     const resultA2 = await promiseA;
     const resultB2 = await promiseB;
-    assert.strictEqual(resultA2.rebuild, resultA1.rebuild)
-    assert.strictEqual(resultB2.rebuild, resultB1.rebuild)
     assert.strictEqual(resultA2.outputFiles, void 0)
     assert.strictEqual(resultB2.outputFiles, void 0)
     assert.strictEqual(await readFileAsync(outputA, 'utf8'), `console.log(1);\n`)
     assert.strictEqual(await readFileAsync(outputB, 'utf8'), `console.log(2);\n`)
 
     // Further rebuilds should not be possible after a dispose
-    resultA1.rebuild.dispose()
+    contextA.dispose()
     try {
-      await resultA1.rebuild()
-      throw new Error('Expected an error to be thrown')
+      await contextA.rebuild()
+      throw new Error('Expected an error to be thrown (context A)')
     } catch (e) {
       assert.strictEqual(e.message, 'Cannot rebuild')
     }
 
     // Build 3
     await writeFileAsync(inputB, `console.log(3)`)
-    const resultB3 = await resultB1.rebuild()
-    assert.strictEqual(resultB3.rebuild, resultB1.rebuild)
+    const resultB3 = await contextB.rebuild()
     assert.strictEqual(resultB3.outputFiles, void 0)
     assert.strictEqual(await readFileAsync(outputB, 'utf8'), `console.log(3);\n`)
 
     // Further rebuilds should not be possible after a dispose
-    resultB1.rebuild.dispose()
+    contextB.dispose()
     try {
-      await resultB1.rebuild()
-      throw new Error('Expected an error to be thrown')
+      await contextB.rebuild()
+      throw new Error('Expected an error to be thrown (context B)')
     } catch (e) {
       assert.strictEqual(e.message, 'Cannot rebuild')
     }
@@ -2386,49 +2629,214 @@ require("/assets/file.png");
   async rebuildParallel({ esbuild, testDir }) {
     const input = path.join(testDir, 'in.js')
     const output = path.join(testDir, 'out.js')
-
-    // Build 1
-    await writeFileAsync(input, `console.log('abc')`)
-    const result1 = await esbuild.build({
+    const context = await esbuild.context({
       entryPoints: [input],
       outfile: output,
       format: 'esm',
-      incremental: true,
     })
-    assert.strictEqual(result1.outputFiles, void 0)
-    assert.strictEqual(await readFileAsync(output, 'utf8'), `console.log("abc");\n`)
 
-    // Build 2
-    await writeFileAsync(input, `console.log('xyz')`)
-    const promise2A = result1.rebuild();
-    const promise2B = result1.rebuild();
-    const result2A = await promise2A;
-    const result2B = await promise2B;
-    assert.strictEqual(result2A.rebuild, result1.rebuild)
-    assert.strictEqual(result2B.rebuild, result1.rebuild)
-    assert.strictEqual(result2A.outputFiles, void 0)
-    assert.strictEqual(result2B.outputFiles, void 0)
-    assert.strictEqual(await readFileAsync(output, 'utf8'), `console.log("xyz");\n`)
+    try {
+      // Build 1
+      await writeFileAsync(input, `console.log('abc')`)
+      const result1 = await context.rebuild()
+      assert.strictEqual(result1.outputFiles, void 0)
+      assert.strictEqual(await readFileAsync(output, 'utf8'), `console.log("abc");\n`)
 
-    // Build 3
-    await writeFileAsync(input, `console.log(123)`)
-    const promise3A = result1.rebuild();
-    const promise3B = result1.rebuild();
-    const result3A = await promise3A;
-    const result3B = await promise3B;
-    assert.strictEqual(result3A.rebuild, result1.rebuild)
-    assert.strictEqual(result3B.rebuild, result1.rebuild)
-    assert.strictEqual(result3A.outputFiles, void 0)
-    assert.strictEqual(result3B.outputFiles, void 0)
-    assert.strictEqual(await readFileAsync(output, 'utf8'), `console.log(123);\n`)
+      // Build 2
+      await writeFileAsync(input, `console.log('xyz')`)
+      const promise2A = context.rebuild();
+      const promise2B = context.rebuild();
+      const result2A = await promise2A;
+      const result2B = await promise2B;
+      assert.strictEqual(result2A.outputFiles, void 0)
+      assert.strictEqual(result2B.outputFiles, void 0)
+      assert.strictEqual(await readFileAsync(output, 'utf8'), `console.log("xyz");\n`)
+
+      // Build 3
+      await writeFileAsync(input, `console.log(123)`)
+      const promise3A = context.rebuild();
+      const promise3B = context.rebuild();
+      const result3A = await promise3A;
+      const result3B = await promise3B;
+      assert.strictEqual(result3A.outputFiles, void 0)
+      assert.strictEqual(result3B.outputFiles, void 0)
+      assert.strictEqual(await readFileAsync(output, 'utf8'), `console.log(123);\n`)
+    } finally {
+      context.dispose()
+    }
 
     // Further rebuilds should not be possible after a dispose
-    result1.rebuild.dispose()
     try {
-      await result1.rebuild()
+      await context.rebuild()
       throw new Error('Expected an error to be thrown')
     } catch (e) {
       assert.strictEqual(e.message, 'Cannot rebuild')
+    }
+  },
+
+  async rebuildCancel({ esbuild }) {
+    let loopForever = true
+    let onEndResult
+    let onLoadCallback
+
+    const context = await esbuild.context({
+      entryPoints: ['entry'],
+      bundle: true,
+      write: false,
+      logLevel: 'silent',
+      format: 'esm',
+      plugins: [{
+        name: '∞',
+        setup(build) {
+          build.onResolve({ filter: /.*/ }, args => {
+            return { path: args.path, namespace: '∞' }
+          })
+          build.onLoad({ filter: /.*/ }, async (args) => {
+            onLoadCallback()
+            if (!loopForever) return { contents: 'foo()' }
+            await new Promise(r => setTimeout(r, 10))
+            return { contents: 'import ' + JSON.stringify(args.path + '.') }
+          })
+          build.onEnd(result => {
+            onEndResult = result
+          })
+        },
+      }],
+    })
+
+    try {
+      // Build 1
+      {
+        // Stop the build when "onLoad" has been called at least 5 times
+        const shouldCancelPromise = new Promise(resolve => {
+          let count = 0
+          onLoadCallback = () => {
+            if (++count > 5) resolve()
+          }
+        })
+
+        // Start a build
+        const buildPromise = context.rebuild()
+
+        // Add a dummy catch handler to avoid terminating due to an unhandled exception
+        buildPromise.catch(() => { })
+
+        // Cancel the build
+        await shouldCancelPromise
+        await context.cancel()
+
+        // Check the result
+        try {
+          await buildPromise
+          throw new Error('Expected an error to be thrown')
+        } catch (error) {
+          assert.strictEqual(error.message, `Build failed with 1 error:\nerror: The build was canceled`)
+          assert.strictEqual(error.errors.length, 1)
+          assert.strictEqual(error.warnings.length, 0)
+          assert.notStrictEqual(onEndResult, undefined)
+          assert.strictEqual(onEndResult.errors.length, 1)
+          assert.strictEqual(onEndResult.errors[0].text, 'The build was canceled')
+          assert.strictEqual(onEndResult.warnings.length, 0)
+          assert.strictEqual(onEndResult.outputFiles.length, 0)
+        }
+      }
+
+      // Build 2
+      {
+        // Stop the build when "onLoad" has been called at least 5 times
+        const shouldCancelPromise = new Promise(resolve => {
+          let count = 0
+          onLoadCallback = () => {
+            if (++count > 5) resolve()
+          }
+        })
+
+        // Start a build
+        const buildPromise = context.rebuild()
+
+        // Add a dummy catch handler to avoid terminating due to an unhandled exception
+        buildPromise.catch(() => { })
+
+        // Cancel the build
+        await shouldCancelPromise
+        await context.cancel()
+
+        // Check the result
+        try {
+          await buildPromise
+          throw new Error('Expected an error to be thrown')
+        } catch (error) {
+          assert.strictEqual(error.message, `Build failed with 1 error:\nerror: The build was canceled`)
+          assert.strictEqual(error.errors.length, 1)
+          assert.strictEqual(error.warnings.length, 0)
+          assert.notStrictEqual(onEndResult, undefined)
+          assert.strictEqual(onEndResult.errors.length, 1)
+          assert.strictEqual(onEndResult.errors[0].text, 'The build was canceled')
+          assert.strictEqual(onEndResult.warnings.length, 0)
+          assert.strictEqual(onEndResult.outputFiles.length, 0)
+        }
+      }
+
+      // Build 3
+      loopForever = false
+      {
+        const result = await context.rebuild()
+        assert.strictEqual(result.errors.length, 0)
+        assert.strictEqual(result.warnings.length, 0)
+        assert.strictEqual(result.outputFiles.length, 1)
+        assert.strictEqual(result.outputFiles[0].text, `// ∞:entry\nfoo();\n`)
+        assert.strictEqual(onEndResult, result)
+      }
+    } finally {
+      context.dispose()
+    }
+  },
+
+  // This test checks for races between manual "rebuild()" and "cancel()".
+  // Ideally calling "cancel()" after "rebuild()" will always cancel it even
+  // if the Go side hasn't started running the rebuild yet. Since Go is multi-
+  // threaded, Go can actually start running the "cancel()" before the
+  // "rebuild()" (i.e. in the other order). The Go code does some complex stuff
+  // with mutexes to try to make this ideal behavior happen despite multi-
+  // threading.
+  async rapidRebuildCancel({ esbuild }) {
+    const context = await esbuild.context({
+      entryPoints: ['entry'],
+      logLevel: 'silent',
+      plugins: [{
+        name: '∞',
+        setup(build) {
+          build.onResolve({ filter: /.*/ }, args => {
+            return { path: args.path, namespace: '∞' }
+          })
+          build.onLoad({ filter: /.*/ }, async (args) => {
+            await new Promise(r => setTimeout(r, 10))
+            return { contents: 'import ' + JSON.stringify(args.path + '.') }
+          })
+        },
+      }],
+    })
+
+    try {
+      const promises = []
+      for (let i = 0; i < 100; i++) {
+        const promise = context.rebuild()
+        promise.catch(() => { /* avoid termination due to an uncaught exception */ })
+        promises.push(promise)
+        await context.cancel()
+      }
+
+      for (let i = 0; i < promises.length; i++) {
+        try {
+          await promises[i]
+          throw new Error('Expected an error to be thrown for rebuild ' + i)
+        } catch (err) {
+          if (!err.errors || err.errors.length !== 1 || err.errors[0].text !== 'The build was canceled')
+            throw err
+        }
+      }
+    } finally {
+      context.dispose()
     }
   },
 
@@ -2576,6 +2984,24 @@ require("/assets/file.png");
     assert.strictEqual(outputFiles.length, 2)
     assert.strictEqual(outputFiles[0].path, path.join(testDir, 'entry', 'out', 'TIORPBNU-1.js'))
     assert.strictEqual(outputFiles[1].path, path.join(testDir, 'entry', 'out', '3KY7NOSR-2.js'))
+  },
+
+  async customEntryPointOutputPathsDuplicates({ esbuild, testDir }) {
+    const input1 = path.join(testDir, 'foo.js')
+    const input2 = path.join(testDir, 'bar.css')
+    await writeFileAsync(input1, `foo()`)
+    await writeFileAsync(input2, `.bar {}`)
+    var { outputFiles } = await esbuild.build({
+      entryPoints: [
+        { in: input1, out: 'abc' },
+        { in: input2, out: 'abc' },
+      ],
+      outdir: testDir,
+      write: false,
+    })
+    assert.strictEqual(outputFiles.length, 2)
+    assert.strictEqual(outputFiles[0].path, path.join(testDir, 'abc.js'))
+    assert.strictEqual(outputFiles[1].path, path.join(testDir, 'abc.css'))
   },
 
   async nodeColonPrefixImport({ esbuild }) {
@@ -3260,16 +3686,44 @@ require("/assets/file.png");
   },
 }
 
-function fetch(host, port, path, headers) {
+function fetch(host, port, path, { headers, method = 'GET' } = {}) {
   return new Promise((resolve, reject) => {
-    http.get({ host, port, path, headers }, res => {
+    http.request({ method, host, port, path, headers }, res => {
       const chunks = []
       res.on('data', chunk => chunks.push(chunk))
       res.on('end', () => {
         const content = Buffer.concat(chunks)
-        if (res.statusCode < 200 || res.statusCode > 299)
-          reject(new Error(`${res.statusCode} when fetching ${path}: ${content}`))
-        else {
+        if (res.statusCode < 200 || res.statusCode > 299) {
+          const error = new Error(`${res.statusCode} when fetching "${path}": ${content}`)
+          error.statusCode = res.statusCode
+          reject(error)
+        } else {
+          content.headers = res.headers
+          resolve(content)
+        }
+      })
+    }).on('error', reject).end()
+  })
+}
+
+function fetchHTTPS(host, port, path, { certfile }) {
+  return new Promise((resolve, reject) => {
+    const checkServerIdentity = (hostname, cert) => {
+      // I'm not sure why node seems to always reject the host "127.0.0.1"
+      assert.strictEqual(hostname, '127.0.0.1')
+      assert.strictEqual(cert.subject.CN, '127.0.0.1')
+    }
+    const ca = [fs.readFileSync(certfile, 'utf8')]
+    https.get({ host, port, path, ca, checkServerIdentity }, res => {
+      const chunks = []
+      res.on('data', chunk => chunks.push(chunk))
+      res.on('end', () => {
+        const content = Buffer.concat(chunks)
+        if (res.statusCode < 200 || res.statusCode > 299) {
+          const error = new Error(`${res.statusCode} when fetching "${path}": ${content}`)
+          error.statusCode = res.statusCode
+          reject(error)
+        } else {
           content.headers = res.headers
           resolve(content)
         }
@@ -3278,7 +3732,108 @@ function fetch(host, port, path, headers) {
   })
 }
 
+const makeEventStream = (host, port, path) => {
+  return new Promise((resolve, reject) => {
+    const headers = {
+      'Accept': 'text/event-stream',
+    }
+
+    http.get({ host, port, path, headers }, res => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`${res.statusCode} when fetching "${path}"`))
+        return
+      }
+
+      const stream = new events.EventEmitter
+      let buffer = ''
+
+      res.on('data', chunk => {
+        buffer += chunk
+        while (true) {
+          const index = buffer.indexOf('\n\n')
+          if (index < 0) break
+
+          const lines = buffer.slice(0, index).split('\n')
+          const fields = Object.create(null)
+          buffer = buffer.slice(index + 2)
+
+          for (const line of lines) {
+            const colon = line.indexOf(':')
+            if (colon >= 0) {
+              const key = line.slice(0, colon).trim()
+              const value = line.slice(colon + 1).trim()
+              fields[key] = value
+            }
+          }
+
+          if ('data' in fields) {
+            stream.emit('event' in fields ? fields.event : 'message', fields)
+          }
+        }
+      })
+
+      res.on('close', () => stream.emit('close'))
+
+      stream.destroy = () => res.destroy()
+
+      stream.waitFor = name => new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Timeout after 30 seconds'))
+          stream.destroy()
+        }, 30 * 1000)
+
+        stream.once(name, value => {
+          clearTimeout(timeout)
+          resolve(value)
+        })
+      })
+
+      resolve(stream)
+    }).on('error', reject)
+  })
+}
+
+const makeRebuildUntilPlugin = () => {
+  let onEnd
+
+  return {
+    rebuildUntil: (mutator, condition) => new Promise((resolve, reject) => {
+      let timeout = setTimeout(() => reject(new Error('Timeout after 30 seconds')), 30 * 1000)
+      onEnd = result => {
+        try { if (result && condition(result)) clearTimeout(timeout), resolve(result) }
+        catch (e) { clearTimeout(timeout), reject(e) }
+      }
+      mutator()
+    }),
+
+    plugin: {
+      name: 'rebuildUntil',
+      setup(build) {
+        build.onEnd(result => onEnd(result))
+      },
+    },
+  }
+}
+
 let watchTests = {
+  async watchTwice({ esbuild }) {
+    const context = await esbuild.context({})
+    try {
+      // Watch once
+      await context.watch()
+
+      // Watch twice
+      try {
+        await context.watch()
+        throw new Error('Expected an error to be thrown')
+      } catch (err) {
+        assert.strictEqual(err.message, 'Watch mode has already been enabled')
+      }
+    } finally {
+      await context.dispose()
+    }
+  },
+
   async watchEditSession({ esbuild, testDir }) {
     const srcDir = path.join(testDir, 'src')
     const outfile = path.join(testDir, 'out.js')
@@ -3286,106 +3841,91 @@ let watchTests = {
     await mkdirAsync(srcDir, { recursive: true })
     await writeFileAsync(input, `throw 1`)
 
-    let onRebuild = () => { }
-    const result = await esbuild.build({
+    const { rebuildUntil, plugin } = makeRebuildUntilPlugin()
+    const context = await esbuild.context({
       entryPoints: [input],
       outfile,
       format: 'esm',
       logLevel: 'silent',
-      watch: {
-        onRebuild: (...args) => onRebuild(args),
-      },
+      plugins: [plugin],
     })
-    const rebuildUntil = (mutator, condition) => {
-      let timeout
-      return new Promise((resolve, reject) => {
-        timeout = setTimeout(() => reject(new Error('Timeout after 30 seconds')), 30 * 1000)
-        onRebuild = args => {
-          try { if (condition(...args)) clearTimeout(timeout), resolve(args) }
-          catch (e) { clearTimeout(timeout), reject(e) }
-        }
-        mutator()
-      })
-    }
 
     try {
+      const result = await rebuildUntil(
+        () => context.watch(),
+        () => true,
+      )
       assert.strictEqual(result.outputFiles, void 0)
-      assert.strictEqual(typeof result.stop, 'function')
+      assert.strictEqual(result.errors.length, 0)
       assert.strictEqual(await readFileAsync(outfile, 'utf8'), 'throw 1;\n')
 
       // First rebuild: edit
       {
-        const [error2, result2] = await rebuildUntil(
+        const result2 = await rebuildUntil(
           () => writeFileAtomic(input, `throw 2`),
           () => fs.readFileSync(outfile, 'utf8') === 'throw 2;\n',
         )
-        assert.strictEqual(error2, null)
         assert.strictEqual(result2.outputFiles, void 0)
-        assert.strictEqual(result2.stop, result.stop)
+        assert.strictEqual(result2.errors.length, 0)
+        assert.strictEqual(await readFileAsync(outfile, 'utf8'), 'throw 2;\n')
       }
 
       // Second rebuild: edit
       {
-        const [error2, result2] = await rebuildUntil(
+        const result2 = await rebuildUntil(
           () => writeFileAtomic(input, `throw 3`),
           () => fs.readFileSync(outfile, 'utf8') === 'throw 3;\n',
         )
-        assert.strictEqual(error2, null)
         assert.strictEqual(result2.outputFiles, void 0)
-        assert.strictEqual(result2.stop, result.stop)
+        assert.strictEqual(result2.errors.length, 0)
+        assert.strictEqual(await readFileAsync(outfile, 'utf8'), 'throw 3;\n')
       }
 
       // Third rebuild: syntax error
       {
-        const [error2, result2] = await rebuildUntil(
+        const result2 = await rebuildUntil(
           () => writeFileAtomic(input, `throw 1 2`),
-          err => err,
+          result => result.errors.length > 0,
         )
-        assert.notStrictEqual(error2, null)
-        assert(error2.message.startsWith('Build failed with 1 error'))
-        assert.strictEqual(error2.errors.length, 1)
-        assert.strictEqual(error2.errors[0].text, 'Expected ";" but found "2"')
-        assert.strictEqual(result2, null)
+        assert.strictEqual(result2.errors.length, 1)
+        assert.strictEqual(result2.errors[0].text, 'Expected ";" but found "2"')
         assert.strictEqual(await readFileAsync(outfile, 'utf8'), 'throw 3;\n')
       }
 
       // Fourth rebuild: edit
       {
-        const [error2, result2] = await rebuildUntil(
+        const result2 = await rebuildUntil(
           () => writeFileAtomic(input, `throw 4`),
           () => fs.readFileSync(outfile, 'utf8') === 'throw 4;\n',
         )
-        assert.strictEqual(error2, null)
         assert.strictEqual(result2.outputFiles, void 0)
-        assert.strictEqual(result2.stop, result.stop)
+        assert.strictEqual(result2.errors.length, 0)
+        assert.strictEqual(await readFileAsync(outfile, 'utf8'), 'throw 4;\n')
       }
 
       // Fifth rebuild: delete
       {
-        const [error2, result2] = await rebuildUntil(
+        const result2 = await rebuildUntil(
           () => fs.promises.unlink(input),
-          err => err,
+          result => result.errors.length > 0,
         )
-        assert.notStrictEqual(error2, null)
-        assert(error2.message.startsWith('Build failed with 1 error'))
-        assert.strictEqual(error2.errors.length, 1)
-        assert.strictEqual(result2, null)
+        assert.strictEqual(result2.errors.length, 1)
+        assert.strictEqual(await readFileAsync(outfile, 'utf8'), 'throw 4;\n')
         assert.strictEqual(await readFileAsync(outfile, 'utf8'), 'throw 4;\n')
       }
 
       // Sixth rebuild: restore
       {
-        const [error2, result2] = await rebuildUntil(
+        const result2 = await rebuildUntil(
           () => writeFileAtomic(input, `throw 5`),
           () => fs.readFileSync(outfile, 'utf8') === 'throw 5;\n',
         )
-        assert.strictEqual(error2, null)
         assert.strictEqual(result2.outputFiles, void 0)
-        assert.strictEqual(result2.stop, result.stop)
+        assert.strictEqual(result2.errors.length, 0)
         assert.strictEqual(await readFileAsync(outfile, 'utf8'), 'throw 5;\n')
       }
     } finally {
-      result.stop()
+      await context.dispose()
     }
   },
 
@@ -3397,97 +3937,269 @@ let watchTests = {
     await mkdirAsync(srcDir, { recursive: true })
     await writeFileAsync(input, `throw 1`)
 
-    let onRebuild = () => { }
-    const result = await esbuild.build({
+    const { rebuildUntil, plugin } = makeRebuildUntilPlugin()
+    const context = await esbuild.context({
       entryPoints: [input],
       outdir,
       format: 'esm',
       logLevel: 'silent',
       write: false,
-      watch: {
-        onRebuild: (...args) => onRebuild(args),
-      },
+      plugins: [plugin],
     })
-    const rebuildUntil = (mutator, condition) => {
-      let timeout
-      return new Promise((resolve, reject) => {
-        timeout = setTimeout(() => reject(new Error('Timeout after 30 seconds')), 30 * 1000)
-        onRebuild = args => {
-          try { if (condition(...args)) clearTimeout(timeout), resolve(args) }
-          catch (e) { clearTimeout(timeout), reject(e) }
-        }
-        mutator()
-      })
-    }
 
     try {
-      assert.strictEqual(result.outputFiles.length, 1)
+      const result = await rebuildUntil(
+        () => context.watch(),
+        () => true,
+      )
+      assert.strictEqual(result.errors.length, 0)
       assert.strictEqual(result.outputFiles[0].text, 'throw 1;\n')
-      assert.strictEqual(typeof result.stop, 'function')
       assert.strictEqual(fs.existsSync(output), false)
 
       // First rebuild: edit
       {
-        const [error2, result2] = await rebuildUntil(
+        const result2 = await rebuildUntil(
           () => writeFileAtomic(input, `throw 2`),
-          (err, res) => res.outputFiles[0].text === 'throw 2;\n',
+          res => res.outputFiles[0].text === 'throw 2;\n',
         )
-        assert.strictEqual(error2, null)
-        assert.strictEqual(result2.stop, result.stop)
+        assert.strictEqual(result2.errors.length, 0)
         assert.strictEqual(fs.existsSync(output), false)
       }
 
       // Second rebuild: edit
       {
-        const [error2, result2] = await rebuildUntil(
+        const result2 = await rebuildUntil(
           () => writeFileAtomic(input, `throw 3`),
-          (err, res) => res.outputFiles[0].text === 'throw 3;\n',
+          res => res.outputFiles[0].text === 'throw 3;\n',
         )
-        assert.strictEqual(error2, null)
-        assert.strictEqual(result2.stop, result.stop)
+        assert.strictEqual(result2.errors.length, 0)
         assert.strictEqual(fs.existsSync(output), false)
       }
     } finally {
-      result.stop()
+      await context.dispose()
+    }
+  },
+
+  async watchMetafile({ esbuild, testDir }) {
+    const srcDir = path.join(testDir, 'src')
+    const outdir = path.join(testDir, 'out')
+    const input = path.join(srcDir, 'in.js')
+    const output = path.join(outdir, 'in.js')
+    await mkdirAsync(srcDir, { recursive: true })
+    await writeFileAsync(input, `foo()`)
+
+    const { rebuildUntil, plugin } = makeRebuildUntilPlugin()
+    const context = await esbuild.context({
+      entryPoints: [input],
+      outdir,
+      format: 'esm',
+      logLevel: 'silent',
+      metafile: true,
+      plugins: [plugin],
+    })
+
+    try {
+      const result = await rebuildUntil(
+        () => context.watch(),
+        () => true,
+      )
+      assert.strictEqual(result.errors.length, 0)
+      const relInput = path.relative(process.cwd(), input).split(path.sep).join('/')
+      assert.strictEqual(result.metafile.inputs[relInput].bytes, 5)
+      assert.strictEqual(await readFileAsync(output, 'utf8'), 'foo();\n')
+
+      // Rebuild and check that the metafile has been updated
+      {
+        const result2 = await rebuildUntil(
+          () => writeFileAtomic(input, `foo(123)`),
+          () => fs.readFileSync(output, 'utf8') === 'foo(123);\n',
+        )
+        assert.strictEqual(result2.errors.length, 0)
+        assert.strictEqual(result2.metafile.inputs[relInput].bytes, 8)
+      }
+    } finally {
+      await context.dispose()
+    }
+  },
+
+  async watchMangleCache({ esbuild, testDir }) {
+    const srcDir = path.join(testDir, 'src')
+    const outdir = path.join(testDir, 'out')
+    const input = path.join(srcDir, 'in.js')
+    const output = path.join(outdir, 'in.js')
+    await mkdirAsync(srcDir, { recursive: true })
+    await writeFileAsync(input, `foo()`)
+
+    const { rebuildUntil, plugin } = makeRebuildUntilPlugin()
+    const context = await esbuild.context({
+      entryPoints: [input],
+      outdir,
+      format: 'esm',
+      logLevel: 'silent',
+      mangleProps: /./,
+      mangleCache: {},
+      plugins: [plugin],
+    })
+
+    try {
+      const result = await rebuildUntil(
+        () => context.watch(),
+        () => true,
+      )
+      assert.strictEqual(result.errors.length, 0)
+      assert.strictEqual(JSON.stringify(result.mangleCache), '{}')
+
+      // Rebuild and check that the mangle cache has been updated
+      {
+        const result2 = await rebuildUntil(
+          () => writeFileAtomic(input, `foo(bar.baz)`),
+          () => fs.readFileSync(output, 'utf8') === 'foo(bar.a);\n',
+        )
+        assert.strictEqual(result2.errors.length, 0)
+        assert.strictEqual(JSON.stringify(result2.mangleCache), '{"baz":"a"}')
+      }
+    } finally {
+      await context.dispose()
     }
   },
 }
 
 let serveTests = {
+  async serveTwice({ esbuild }) {
+    const context = await esbuild.context({})
+    try {
+      // Serve once
+      await context.serve()
+
+      // Serve twice
+      try {
+        await context.serve()
+        throw new Error('Expected an error to be thrown')
+      } catch (err) {
+        assert.strictEqual(err.message, 'Serve mode has already been enabled')
+      }
+    } finally {
+      await context.dispose()
+    }
+  },
+
+  async serveWatch({ esbuild, testDir }) {
+    const input = path.join(testDir, 'in.ts')
+    const outfile = path.join(testDir, 'out.js')
+
+    const { rebuildUntil, plugin } = makeRebuildUntilPlugin()
+    const context = await esbuild.context({
+      entryPoints: [input],
+      outfile,
+      logLevel: 'silent',
+      plugins: [plugin],
+    })
+
+    try {
+      await context.watch()
+      const server = await context.serve({
+        host: '127.0.0.1',
+      })
+
+      // Try fetching the non-existent file
+      try {
+        await fetch(server.host, server.port, '/' + path.basename(outfile))
+        throw new Error('Expected an error to be thrown')
+      } catch (err) {
+        if (err.statusCode !== 503) throw err
+      }
+
+      // Check that watch mode works
+      for (let i = 0; i < 5; i++) {
+        const result = await rebuildUntil(
+          () => writeFileAtomic(input, `throw ${i}`),
+          () => fs.readFileSync(outfile, 'utf8') === `throw ${i};\n`,
+        )
+        assert.strictEqual(result.errors.length, 0)
+        assert.strictEqual(fs.readFileSync(outfile, 'utf8'), `throw ${i};\n`)
+      }
+
+      // Try fetching the file now
+      const data = await fetch(server.host, server.port, '/' + path.basename(outfile))
+      assert.strictEqual(data.toString(), 'throw 4;\n')
+    } finally {
+      await context.dispose()
+    }
+  },
+
   async serveBasic({ esbuild, testDir }) {
     const input = path.join(testDir, 'in.js')
     await writeFileAsync(input, `console.log(123)`)
 
     let onRequest;
-    let singleRequestPromise = new Promise(resolve => {
-      onRequest = resolve;
-    });
 
-    const result = await esbuild.serve({
-      host: '127.0.0.1',
-      onRequest,
-    }, {
+    const context = await esbuild.context({
       entryPoints: [input],
       format: 'esm',
-    })
-    assert.strictEqual(result.host, '127.0.0.1');
-    assert.strictEqual(typeof result.port, 'number');
+      outdir: testDir,
+      write: false,
+    });
+    try {
+      const result = await context.serve({
+        host: '127.0.0.1',
+        onRequest: args => onRequest(args),
+      })
+      assert.strictEqual(result.host, '127.0.0.1');
+      assert.strictEqual(typeof result.port, 'number');
 
-    const buffer = await fetch(result.host, result.port, '/in.js')
-    assert.strictEqual(buffer.toString(), `console.log(123);\n`);
+      // GET /in.js
+      {
+        const singleRequestPromise = new Promise(resolve => { onRequest = resolve });
+        const buffer = await fetch(result.host, result.port, '/in.js')
+        assert.strictEqual(buffer.toString(), `console.log(123);\n`);
+        assert.strictEqual(fs.readFileSync(input, 'utf8'), `console.log(123)`)
 
-    let singleRequest = await singleRequestPromise;
-    assert.strictEqual(singleRequest.method, 'GET');
-    assert.strictEqual(singleRequest.path, '/in.js');
-    assert.strictEqual(singleRequest.status, 200);
-    assert.strictEqual(typeof singleRequest.remoteAddress, 'string');
-    assert.strictEqual(typeof singleRequest.timeInMS, 'number');
+        let singleRequest = await singleRequestPromise;
+        assert.strictEqual(singleRequest.method, 'GET');
+        assert.strictEqual(singleRequest.path, '/in.js');
+        assert.strictEqual(singleRequest.status, 200);
+        assert.strictEqual(typeof singleRequest.remoteAddress, 'string');
+        assert.strictEqual(typeof singleRequest.timeInMS, 'number');
+      }
 
-    result.stop();
-    await result.wait;
+      // HEAD /in.js
+      {
+        const singleRequestPromise = new Promise(resolve => { onRequest = resolve });
+        const buffer = await fetch(result.host, result.port, '/in.js', { method: 'HEAD' })
+        assert.strictEqual(buffer.toString(), ``); // HEAD omits the content
+        assert.strictEqual(fs.readFileSync(input, 'utf8'), `console.log(123)`)
+
+        let singleRequest = await singleRequestPromise;
+        assert.strictEqual(singleRequest.method, 'HEAD');
+        assert.strictEqual(singleRequest.path, '/in.js');
+        assert.strictEqual(singleRequest.status, 200);
+        assert.strictEqual(typeof singleRequest.remoteAddress, 'string');
+        assert.strictEqual(typeof singleRequest.timeInMS, 'number');
+      }
+    } finally {
+      await context.dispose();
+    }
   },
 
-  async serveOutfile({ esbuild, testDir }) {
+  async serveBasicHTTPS({ esbuild, testDir }) {
+    const run = command => new Promise((resolve, reject) => {
+      child_process.execFile(command.shift(), command, (error, stdout, stderr) => {
+        if (error) reject(error)
+        else resolve()
+      })
+    })
+
+    try {
+      await run(['which', 'openssl'])
+    } catch {
+      console.warn('Skipping HTTPS tests because the "openssl" command was not found')
+      return
+    }
+
+    const keyfile = path.join(testDir, 'key.pem')
+    const certfile = path.join(testDir, 'cert.pem')
+    await run(['openssl', 'req', '-x509', '-newkey', 'rsa:4096', '-keyout', keyfile, '-out', certfile, '-days', '9999', '-nodes', '-subj', '/CN=127.0.0.1'])
+
     const input = path.join(testDir, 'in.js')
     await writeFileAsync(input, `console.log(123)`)
 
@@ -3496,37 +4208,80 @@ let serveTests = {
       onRequest = resolve;
     });
 
-    const result = await esbuild.serve({
-      host: '127.0.0.1',
-      onRequest,
-    }, {
+    const context = await esbuild.context({
       entryPoints: [input],
       format: 'esm',
-      outfile: 'out.js',
-    })
-    assert.strictEqual(result.host, '127.0.0.1');
-    assert.strictEqual(typeof result.port, 'number');
-
-    const buffer = await fetch(result.host, result.port, '/out.js')
-    assert.strictEqual(buffer.toString(), `console.log(123);\n`);
-
-    let singleRequest = await singleRequestPromise;
-    assert.strictEqual(singleRequest.method, 'GET');
-    assert.strictEqual(singleRequest.path, '/out.js');
-    assert.strictEqual(singleRequest.status, 200);
-    assert.strictEqual(typeof singleRequest.remoteAddress, 'string');
-    assert.strictEqual(typeof singleRequest.timeInMS, 'number');
-
+      outdir: testDir,
+      write: false,
+    });
     try {
-      await fetch(result.host, result.port, '/in.js')
-      throw new Error('Expected a 404 error for "/in.js"')
-    } catch (err) {
-      if (err.message !== '404 when fetching /in.js: 404 - Not Found')
-        throw err
-    }
+      const result = await context.serve({
+        host: '127.0.0.1',
+        keyfile,
+        certfile,
+        onRequest,
+      })
+      assert.strictEqual(result.host, '127.0.0.1');
+      assert.strictEqual(typeof result.port, 'number');
 
-    result.stop();
-    await result.wait;
+      const buffer = await fetchHTTPS(result.host, result.port, '/in.js', { certfile })
+      assert.strictEqual(buffer.toString(), `console.log(123);\n`);
+      assert.strictEqual(fs.readFileSync(input, 'utf8'), `console.log(123)`)
+
+      let singleRequest = await singleRequestPromise;
+      assert.strictEqual(singleRequest.method, 'GET');
+      assert.strictEqual(singleRequest.path, '/in.js');
+      assert.strictEqual(singleRequest.status, 200);
+      assert.strictEqual(typeof singleRequest.remoteAddress, 'string');
+      assert.strictEqual(typeof singleRequest.timeInMS, 'number');
+    } finally {
+      await context.dispose();
+    }
+  },
+
+  async serveOutfile({ esbuild, testDir }) {
+    const input = path.join(testDir, 'in.js')
+    const outfile = path.join(testDir, 'out.js')
+    await writeFileAsync(input, `console.log(123)`)
+
+    let onRequest;
+    let singleRequestPromise = new Promise(resolve => {
+      onRequest = resolve;
+    });
+
+    const context = await esbuild.context({
+      entryPoints: [input],
+      format: 'esm',
+      outfile,
+    });
+    try {
+      const result = await context.serve({
+        host: '127.0.0.1',
+        onRequest,
+      })
+      assert.strictEqual(result.host, '127.0.0.1');
+      assert.strictEqual(typeof result.port, 'number');
+
+      const buffer = await fetch(result.host, result.port, '/out.js')
+      assert.strictEqual(buffer.toString(), `console.log(123);\n`);
+
+      let singleRequest = await singleRequestPromise;
+      assert.strictEqual(singleRequest.method, 'GET');
+      assert.strictEqual(singleRequest.path, '/out.js');
+      assert.strictEqual(singleRequest.status, 200);
+      assert.strictEqual(typeof singleRequest.remoteAddress, 'string');
+      assert.strictEqual(typeof singleRequest.timeInMS, 'number');
+
+      try {
+        await fetch(result.host, result.port, '/in.js')
+        throw new Error('Expected a 404 error for "/in.js"')
+      } catch (err) {
+        if (err.message !== '404 when fetching "/in.js": 404 - Not Found')
+          throw err
+      }
+    } finally {
+      await context.dispose();
+    }
   },
 
   async serveWithFallbackDir({ esbuild, testDir }) {
@@ -3549,71 +4304,80 @@ let serveTests = {
       });
     })();
 
-    const result = await esbuild.serve({
-      host: '127.0.0.1',
-      onRequest: args => onRequest(args),
-      servedir: wwwDir,
-    }, {
+    const context = await esbuild.context({
       entryPoints: [input],
       format: 'esm',
-    })
-    assert.strictEqual(result.host, '127.0.0.1');
-    assert.strictEqual(typeof result.port, 'number');
+      outdir: wwwDir,
+      write: false,
+    });
+    try {
+      const result = await context.serve({
+        host: '127.0.0.1',
+        onRequest: args => onRequest(args),
+        servedir: wwwDir,
+      })
+      assert.strictEqual(result.host, '127.0.0.1');
+      assert.strictEqual(typeof result.port, 'number');
 
-    let promise, buffer, req;
+      let promise, buffer, req;
 
-    promise = nextRequestPromise;
-    buffer = await fetch(result.host, result.port, '/in.js')
-    assert.strictEqual(buffer.toString(), `console.log(123);\n`);
-    req = await promise;
-    assert.strictEqual(req.method, 'GET');
-    assert.strictEqual(req.path, '/in.js');
-    assert.strictEqual(req.status, 200);
-    assert.strictEqual(typeof req.remoteAddress, 'string');
-    assert.strictEqual(typeof req.timeInMS, 'number');
+      promise = nextRequestPromise;
+      buffer = await fetch(result.host, result.port, '/in.js')
+      assert.strictEqual(buffer.toString(), `console.log(123);\n`);
+      assert.strictEqual(fs.existsSync(path.join(wwwDir, path.basename(input))), false);
+      req = await promise;
+      assert.strictEqual(req.method, 'GET');
+      assert.strictEqual(req.path, '/in.js');
+      assert.strictEqual(req.status, 200);
+      assert.strictEqual(typeof req.remoteAddress, 'string');
+      assert.strictEqual(typeof req.timeInMS, 'number');
 
-    promise = nextRequestPromise;
-    buffer = await fetch(result.host, result.port, '/')
-    assert.strictEqual(buffer.toString(), `<!doctype html>`);
-    req = await promise;
-    assert.strictEqual(req.method, 'GET');
-    assert.strictEqual(req.path, '/');
-    assert.strictEqual(req.status, 200);
-    assert.strictEqual(typeof req.remoteAddress, 'string');
-    assert.strictEqual(typeof req.timeInMS, 'number');
-
-    result.stop();
-    await result.wait;
+      promise = nextRequestPromise;
+      buffer = await fetch(result.host, result.port, '/')
+      assert.strictEqual(buffer.toString(), `<!doctype html>`);
+      req = await promise;
+      assert.strictEqual(req.method, 'GET');
+      assert.strictEqual(req.path, '/');
+      assert.strictEqual(req.status, 200);
+      assert.strictEqual(typeof req.remoteAddress, 'string');
+      assert.strictEqual(typeof req.timeInMS, 'number');
+    } finally {
+      await context.dispose();
+    }
   },
 
   async serveWithFallbackDirAndSiblingOutputDir({ esbuild, testDir }) {
+    const context = await esbuild.context({
+      entryPoints: [path.join(testDir, 'in.js')],
+      outdir: 'out',
+    });
     try {
-      const result = await esbuild.serve({
+      await context.serve({
         servedir: 'www',
-      }, {
-        entryPoints: [path.join(testDir, 'in.js')],
-        outdir: 'out',
-      })
-      result.stop()
+      });
       throw new Error('Expected an error to be thrown')
     } catch (e) {
-      assert.strictEqual(e + '', `Error: Output directory "out" must be contained in serve directory "www"`)
+      assert.strictEqual(e.message, `Output directory "out" must be contained in serve directory "www"`)
+    } finally {
+      await context.dispose();
     }
   },
 
   async serveWithFallbackDirAndParentOutputDir({ esbuild, testDir }) {
+    const context = await esbuild.context({
+      entryPoints: [path.join(testDir, 'in.js')],
+      outdir: testDir,
+      absWorkingDir: testDir,
+    });
     try {
-      const result = await esbuild.serve({
+      await context.serve({
         servedir: path.join(testDir, 'www'),
-      }, {
-        entryPoints: [path.join(testDir, 'in.js')],
-        outdir: testDir,
-        absWorkingDir: testDir,
       })
-      result.stop()
       throw new Error('Expected an error to be thrown')
     } catch (e) {
-      assert.strictEqual(e + '', `Error: Output directory "." must be contained in serve directory "www"`)
+      assert.strictEqual(e.message, `Output directory "." must be contained in serve directory "www"`)
+    } finally {
+      await context.dispose();
     }
   },
 
@@ -3638,42 +4402,59 @@ let serveTests = {
       });
     })();
 
-    const result = await esbuild.serve({
-      host: '127.0.0.1',
-      onRequest: args => onRequest(args),
-      servedir: wwwDir,
-    }, {
+    const context = await esbuild.context({
       entryPoints: [input],
       format: 'esm',
       outdir: outputDir,
     })
-    assert.strictEqual(result.host, '127.0.0.1');
-    assert.strictEqual(typeof result.port, 'number');
+    try {
+      const result = await context.serve({
+        host: '127.0.0.1',
+        onRequest: args => onRequest(args),
+        servedir: wwwDir,
+      })
+      assert.strictEqual(result.host, '127.0.0.1');
+      assert.strictEqual(typeof result.port, 'number');
 
-    let promise, buffer, req;
+      let promise, buffer, req;
 
-    promise = nextRequestPromise;
-    buffer = await fetch(result.host, result.port, '/out/in.js')
-    assert.strictEqual(buffer.toString(), `console.log(123);\n`);
-    req = await promise;
-    assert.strictEqual(req.method, 'GET');
-    assert.strictEqual(req.path, '/out/in.js');
-    assert.strictEqual(req.status, 200);
-    assert.strictEqual(typeof req.remoteAddress, 'string');
-    assert.strictEqual(typeof req.timeInMS, 'number');
+      promise = nextRequestPromise;
+      buffer = await fetch(result.host, result.port, '/out/in.js')
+      assert.strictEqual(buffer.toString(), `console.log(123);\n`);
+      req = await promise;
+      assert.strictEqual(req.method, 'GET');
+      assert.strictEqual(req.path, '/out/in.js');
+      assert.strictEqual(req.status, 200);
+      assert.strictEqual(typeof req.remoteAddress, 'string');
+      assert.strictEqual(typeof req.timeInMS, 'number');
 
-    promise = nextRequestPromise;
-    buffer = await fetch(result.host, result.port, '/')
-    assert.strictEqual(buffer.toString(), `<!doctype html>`);
-    req = await promise;
-    assert.strictEqual(req.method, 'GET');
-    assert.strictEqual(req.path, '/');
-    assert.strictEqual(req.status, 200);
-    assert.strictEqual(typeof req.remoteAddress, 'string');
-    assert.strictEqual(typeof req.timeInMS, 'number');
+      promise = nextRequestPromise;
+      buffer = await fetch(result.host, result.port, '/')
+      assert.strictEqual(buffer.toString(), `<!doctype html>`);
+      req = await promise;
+      assert.strictEqual(req.method, 'GET');
+      assert.strictEqual(req.path, '/');
+      assert.strictEqual(req.status, 200);
+      assert.strictEqual(typeof req.remoteAddress, 'string');
+      assert.strictEqual(typeof req.timeInMS, 'number');
 
-    result.stop();
-    await result.wait;
+      // Make sure the output directory prefix requires a slash separator
+      promise = nextRequestPromise;
+      try {
+        await fetch(result.host, result.port, '/outin.js')
+        throw new Error('Expected an error to be thrown')
+      } catch (err) {
+        if (err.statusCode !== 404) throw err
+      }
+      req = await promise;
+      assert.strictEqual(req.method, 'GET');
+      assert.strictEqual(req.path, '/outin.js');
+      assert.strictEqual(req.status, 404);
+      assert.strictEqual(typeof req.remoteAddress, 'string');
+      assert.strictEqual(typeof req.timeInMS, 'number');
+    } finally {
+      await context.dispose();
+    }
   },
 
   async serveWithFallbackDirNoEntryPoints({ esbuild, testDir }) {
@@ -3692,42 +4473,43 @@ let serveTests = {
       });
     })();
 
-    const result = await esbuild.serve({
-      host: '127.0.0.1',
-      onRequest: args => onRequest(args),
-      servedir: testDir,
-    }, {
-    })
-    assert.strictEqual(result.host, '127.0.0.1');
-    assert.strictEqual(typeof result.port, 'number');
+    const context = await esbuild.context({});
+    try {
+      const result = await context.serve({
+        host: '127.0.0.1',
+        onRequest: args => onRequest(args),
+        servedir: testDir,
+      })
+      assert.strictEqual(result.host, '127.0.0.1');
+      assert.strictEqual(typeof result.port, 'number');
 
-    let promise, buffer, req;
+      let promise, buffer, req;
 
-    promise = nextRequestPromise;
-    buffer = await fetch(result.host, result.port, '/')
-    assert.strictEqual(buffer.toString(), `<!doctype html>`);
-    req = await promise;
-    assert.strictEqual(req.method, 'GET');
-    assert.strictEqual(req.path, '/');
-    assert.strictEqual(req.status, 200);
-    assert.strictEqual(typeof req.remoteAddress, 'string');
-    assert.strictEqual(typeof req.timeInMS, 'number');
+      promise = nextRequestPromise;
+      buffer = await fetch(result.host, result.port, '/')
+      assert.strictEqual(buffer.toString(), `<!doctype html>`);
+      req = await promise;
+      assert.strictEqual(req.method, 'GET');
+      assert.strictEqual(req.path, '/');
+      assert.strictEqual(req.status, 200);
+      assert.strictEqual(typeof req.remoteAddress, 'string');
+      assert.strictEqual(typeof req.timeInMS, 'number');
 
-    // Check that removing the file removes it from the directory listing (i.e. the
-    // "fs.FS" object in Go does not cache the result of calling "ReadDirectory")
-    await fs.promises.unlink(index)
-    promise = nextRequestPromise;
-    buffer = await fetch(result.host, result.port, '/')
-    assert.strictEqual(buffer.toString(), `<!doctype html><meta charset="utf8"><title>Directory: /</title><h1>Directory: /</h1><ul></ul>`);
-    req = await promise;
-    assert.strictEqual(req.method, 'GET');
-    assert.strictEqual(req.path, '/');
-    assert.strictEqual(req.status, 200);
-    assert.strictEqual(typeof req.remoteAddress, 'string');
-    assert.strictEqual(typeof req.timeInMS, 'number');
-
-    result.stop();
-    await result.wait;
+      // Check that removing the file removes it from the directory listing (i.e. the
+      // "fs.FS" object in Go does not cache the result of calling "ReadDirectory")
+      await fs.promises.unlink(index)
+      promise = nextRequestPromise;
+      buffer = await fetch(result.host, result.port, '/')
+      assert.notStrictEqual(buffer.toString(), '<!doctype html>')
+      req = await promise;
+      assert.strictEqual(req.method, 'GET');
+      assert.strictEqual(req.path, '/');
+      assert.strictEqual(req.status, 200);
+      assert.strictEqual(typeof req.remoteAddress, 'string');
+      assert.strictEqual(typeof req.timeInMS, 'number');
+    } finally {
+      await context.dispose();
+    }
   },
 
   async serveRange({ esbuild, testDir }) {
@@ -3736,36 +4518,371 @@ let serveTests = {
     const buffer = require('crypto').randomBytes(byteCount)
     await writeFileAsync(big, buffer)
 
-    const result = await esbuild.serve({
-      host: '127.0.0.1',
-      servedir: testDir,
-    }, {})
-
-    // Test small to big ranges
-    const minLength = 1
-    const maxLength = buffer.length
-
-    for (let i = 0, n = 16; i < n; i++) {
-      const length = Math.round(minLength + (maxLength - minLength) * i / (n - 1))
-      const start = Math.floor(Math.random() * (buffer.length - length))
-      const fetched = await fetch(result.host, result.port, '/big.txt', {
-        // Subtract 1 because range headers are inclusive on both ends
-        Range: `bytes=${start}-${start + length - 1}`,
+    const context = await esbuild.context({});
+    try {
+      const result = await context.serve({
+        host: '127.0.0.1',
+        servedir: testDir,
       })
-      delete fetched.headers.date
-      const expected = buffer.slice(start, start + length)
-      expected.headers = {
-        'access-control-allow-origin': '*',
-        'content-length': `${length}`,
-        'content-range': `bytes ${start}-${start + length - 1}/${byteCount}`,
-        'content-type': 'application/octet-stream',
-        'connection': 'close',
+
+      // Test small to big ranges
+      const minLength = 1
+      const maxLength = buffer.length
+
+      for (let i = 0, n = 16; i < n; i++) {
+        const length = Math.round(minLength + (maxLength - minLength) * i / (n - 1))
+        const start = Math.floor(Math.random() * (buffer.length - length))
+        const headers = {
+          // Subtract 1 because range headers are inclusive on both ends
+          Range: `bytes=${start}-${start + length - 1}`,
+        }
+        const fetched = await fetch(result.host, result.port, '/big.txt', { headers })
+        delete fetched.headers.date // This changes every time
+        delete fetched.headers.connection // Node v19+ no longer sends this
+        const expected = buffer.slice(start, start + length)
+        expected.headers = {
+          'access-control-allow-origin': '*',
+          'content-length': `${length}`,
+          'content-range': `bytes ${start}-${start + length - 1}/${byteCount}`,
+          'content-type': 'application/octet-stream',
+        }
+        assert.deepStrictEqual(fetched, expected)
       }
-      assert.deepStrictEqual(fetched, expected)
+    } finally {
+      await context.dispose();
+    }
+  },
+
+  async serveWatchCopyLoaderWithEntryPoint({ esbuild, testDir }) {
+    const ts = path.join(testDir, 'script.ts')
+    const html = path.join(testDir, 'index.html')
+    const outdir = path.join(testDir, 'out')
+    await writeFileAsync(ts, `console.log(123)`)
+    await writeFileAsync(html, `<script src=script.js></script>`)
+
+    const context = await esbuild.context({
+      entryPoints: [ts, html],
+      outdir,
+      loader: { '.html': 'copy' },
+    });
+    try {
+      const server = await context.serve({
+        host: '127.0.0.1',
+        servedir: testDir,
+      })
+      await context.watch()
+
+      const js = await fetch(server.host, server.port, '/out/script.js')
+      assert.strictEqual(js.toString(), `console.log(123);\n`);
+
+      const explicitHTML = await fetch(server.host, server.port, '/out/index.html')
+      assert.strictEqual(explicitHTML.toString(), `<script src=script.js></script>`);
+
+      // The server should support implicit "index.html" extensions on entry point files
+      const implicitHTML = await fetch(server.host, server.port, '/out/')
+      assert.strictEqual(implicitHTML.toString(), `<script src=script.js></script>`);
+
+      // Make a change to the HTML
+      await writeFileAsync(html, `<!DOCTYPE html><script src=script.js></script>`)
+
+      // Wait for watch mode to rebuild
+      const start = Date.now()
+      while (true) {
+        if (Date.now() - start > 30 * 1000) throw new Error('Timeout after 30 seconds')
+        const toCheck = fs.readFileSync(path.join(outdir, 'index.html'), 'utf8')
+        if (toCheck === `<!DOCTYPE html><script src=script.js></script>`) break
+      }
+    } finally {
+      await context.dispose();
+    }
+  },
+
+  async serveWithoutServedirWatchLiveReload({ esbuild, testDir }) {
+    const js = path.join(testDir, 'app.js')
+    const css = path.join(testDir, 'app.css')
+    const outdir = path.join(testDir, 'out')
+    await writeFileAsync(css, ``)
+
+    let endPromise
+    const context = await esbuild.context({
+      entryPoints: [js],
+      outdir,
+      bundle: true,
+      logLevel: 'silent',
+    });
+
+    try {
+      const server = await context.serve({
+        host: '127.0.0.1',
+      })
+      const stream = await makeEventStream(server.host, server.port, '/esbuild')
+      await context.rebuild().then(
+        () => Promise.reject(new Error('Expected an error to be thrown')),
+        () => { /* Ignore the build error due to the missing JS file */ },
+      )
+
+      // Event 1: a new JavaScript file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, ``)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: ['/app.js'], removed: [], updated: [] })
+
+      // Event 2: edit the JavaScript file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `foo()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: [], updated: ['/app.js'] })
+
+      // Event 3: a new CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `import "./app.css"; foo()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: ['/app.css'], removed: [], updated: [] })
+
+      // Event 4: edit the CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(css, `a { color: red }`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: [], updated: ['/app.css'] })
+
+      // Event 5: remove the CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `bar()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: ['/app.css'], updated: ['/app.js'] })
+
+      // Wait for the stream to end once we call "dispose()" below
+      endPromise = stream.waitFor('close')
     }
 
-    result.stop();
-    await result.wait;
+    finally {
+      await context.dispose();
+    }
+
+    // This stream should end once "dispose()" is called above
+    await endPromise
+  },
+
+  async serveWithServedirWatchLiveReload({ esbuild, testDir }) {
+    const js = path.join(testDir, 'app.js')
+    const css = path.join(testDir, 'app.css')
+    const outdir = path.join(testDir, 'out')
+    await writeFileAsync(css, ``)
+
+    let endPromise
+    const context = await esbuild.context({
+      entryPoints: [js],
+      outdir,
+      bundle: true,
+      logLevel: 'silent',
+    });
+
+    try {
+      const server = await context.serve({
+        host: '127.0.0.1',
+        servedir: testDir,
+      })
+      const stream = await makeEventStream(server.host, server.port, '/esbuild')
+      await context.rebuild().then(
+        () => Promise.reject(new Error('Expected an error to be thrown')),
+        () => { /* Ignore the build error due to the missing JS file */ },
+      )
+
+      // Event 1: a new JavaScript file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, ``)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: ['/out/app.js'], removed: [], updated: [] })
+
+      // Event 2: edit the JavaScript file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `foo()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: [], updated: ['/out/app.js'] })
+
+      // Event 3: a new CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `import "./app.css"; foo()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: ['/out/app.css'], removed: [], updated: [] })
+
+      // Event 4: edit the CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(css, `a { color: red }`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: [], updated: ['/out/app.css'] })
+
+      // Event 5: remove the CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `bar()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: ['/out/app.css'], updated: ['/out/app.js'] })
+
+      // Wait for the stream to end once we call "dispose()" below
+      endPromise = stream.waitFor('close')
+    }
+
+    finally {
+      await context.dispose();
+    }
+
+    // This stream should end once "dispose()" is called above
+    await endPromise
+  },
+
+  async serveWithoutServedirWatchLiveReloadPublicPath({ esbuild, testDir }) {
+    const js = path.join(testDir, 'app.js')
+    const css = path.join(testDir, 'app.css')
+    const outdir = path.join(testDir, 'out')
+    await writeFileAsync(css, ``)
+
+    let endPromise
+    const context = await esbuild.context({
+      entryPoints: [js],
+      outdir,
+      bundle: true,
+      logLevel: 'silent',
+      publicPath: 'http://example.com/about',
+    });
+
+    try {
+      const server = await context.serve({
+        host: '127.0.0.1',
+      })
+      const stream = await makeEventStream(server.host, server.port, '/esbuild')
+      await context.rebuild().then(
+        () => Promise.reject(new Error('Expected an error to be thrown')),
+        () => { /* Ignore the build error due to the missing JS file */ },
+      )
+
+      // Event 1: a new JavaScript file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, ``)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: ['http://example.com/about/app.js'], removed: [], updated: [] })
+
+      // Event 2: edit the JavaScript file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `foo()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: [], updated: ['http://example.com/about/app.js'] })
+
+      // Event 3: a new CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `import "./app.css"; foo()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: ['http://example.com/about/app.css'], removed: [], updated: [] })
+
+      // Event 4: edit the CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(css, `a { color: red }`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: [], updated: ['http://example.com/about/app.css'] })
+
+      // Event 5: remove the CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `bar()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: ['http://example.com/about/app.css'], updated: ['http://example.com/about/app.js'] })
+
+      // Wait for the stream to end once we call "dispose()" below
+      endPromise = stream.waitFor('close')
+    }
+
+    finally {
+      await context.dispose();
+    }
+
+    // This stream should end once "dispose()" is called above
+    await endPromise
+  },
+
+  async serveWithServedirWatchLiveReloadPublicPath({ esbuild, testDir }) {
+    const js = path.join(testDir, 'app.js')
+    const css = path.join(testDir, 'app.css')
+    const outdir = path.join(testDir, 'out')
+    await writeFileAsync(css, ``)
+
+    let endPromise
+    const context = await esbuild.context({
+      entryPoints: [js],
+      outdir,
+      bundle: true,
+      logLevel: 'silent',
+      publicPath: 'http://example.com/about',
+    });
+
+    try {
+      const server = await context.serve({
+        host: '127.0.0.1',
+        servedir: testDir,
+      })
+      const stream = await makeEventStream(server.host, server.port, '/esbuild')
+      await context.rebuild().then(
+        () => Promise.reject(new Error('Expected an error to be thrown')),
+        () => { /* Ignore the build error due to the missing JS file */ },
+      )
+
+      // Event 1: a new JavaScript file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, ``)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: ['http://example.com/about/out/app.js'], removed: [], updated: [] })
+
+      // Event 2: edit the JavaScript file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `foo()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: [], updated: ['http://example.com/about/out/app.js'] })
+
+      // Event 3: a new CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `import "./app.css"; foo()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: ['http://example.com/about/out/app.css'], removed: [], updated: [] })
+
+      // Event 4: edit the CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(css, `a { color: red }`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: [], updated: ['http://example.com/about/out/app.css'] })
+
+      // Event 5: remove the CSS file
+      var eventPromise = stream.waitFor('change')
+      await writeFileAsync(js, `bar()`)
+      await context.rebuild()
+      var data = JSON.parse((await eventPromise).data)
+      assert.deepStrictEqual(data, { added: [], removed: ['http://example.com/about/out/app.css'], updated: ['http://example.com/about/out/app.js'] })
+
+      // Wait for the stream to end once we call "dispose()" below
+      endPromise = stream.waitFor('close')
+    }
+
+    finally {
+      await context.dispose();
+    }
+
+    // This stream should end once "dispose()" is called above
+    await endPromise
   },
 }
 
@@ -4206,7 +5323,7 @@ let transformTests = {
       },
       loader: 'jsx',
     })
-    assert.strictEqual(code3, `import { Fragment, jsx } from "react/jsx-runtime";\n/* @__PURE__ */ jsx(Fragment, {\n  children: /* @__PURE__ */ jsx("div", {})\n});\n`)
+    assert.strictEqual(code3, `import { Fragment, jsx } from "react/jsx-runtime";\n/* @__PURE__ */ jsx(Fragment, { children: /* @__PURE__ */ jsx("div", {}) });\n`)
 
     const { code: code4 } = await esbuild.transform(`<><div/></>`, {
       tsconfigRaw: {
@@ -4217,7 +5334,7 @@ let transformTests = {
       },
       loader: 'jsx',
     })
-    assert.strictEqual(code4, `import { Fragment, jsx } from "notreact/jsx-runtime";\n/* @__PURE__ */ jsx(Fragment, {\n  children: /* @__PURE__ */ jsx("div", {})\n});\n`)
+    assert.strictEqual(code4, `import { Fragment, jsx } from "notreact/jsx-runtime";\n/* @__PURE__ */ jsx(Fragment, { children: /* @__PURE__ */ jsx("div", {}) });\n`)
 
     const { code: code5 } = await esbuild.transform(`<><div/></>`, {
       tsconfigRaw: {
@@ -4227,7 +5344,7 @@ let transformTests = {
       },
       loader: 'jsx',
     })
-    assert.strictEqual(code5, `import { Fragment, jsxDEV } from "react/jsx-dev-runtime";\n/* @__PURE__ */ jsxDEV(Fragment, {\n  children: /* @__PURE__ */ jsxDEV("div", {}, void 0, false, {\n    fileName: "<stdin>",\n    lineNumber: 1,\n    columnNumber: 3\n  }, this)\n}, void 0, false, {\n  fileName: "<stdin>",\n  lineNumber: 1,\n  columnNumber: 1\n}, this);\n`)
+    assert.strictEqual(code5, `import { Fragment, jsxDEV } from "react/jsx-dev-runtime";\n/* @__PURE__ */ jsxDEV(Fragment, { children: /* @__PURE__ */ jsxDEV("div", {}, void 0, false, {\n  fileName: "<stdin>",\n  lineNumber: 1,\n  columnNumber: 3\n}, this) }, void 0, false, {\n  fileName: "<stdin>",\n  lineNumber: 1,\n  columnNumber: 1\n}, this);\n`)
   },
 
   // Note: tree shaking is disabled when the output format isn't IIFE
@@ -4650,19 +5767,25 @@ let transformTests = {
   },
 
   async define({ esbuild }) {
-    const define = { 'process.env.NODE_ENV': '"production"' }
+    const define = { 'process.env.NODE_ENV': '"something"' }
 
     const { code: code1 } = await esbuild.transform(`console.log(process.env.NODE_ENV)`, { define })
-    assert.strictEqual(code1, `console.log("production");\n`)
+    assert.strictEqual(code1, `console.log("something");\n`)
 
     const { code: code2 } = await esbuild.transform(`console.log(process.env['NODE_ENV'])`, { define })
-    assert.strictEqual(code2, `console.log("production");\n`)
+    assert.strictEqual(code2, `console.log("something");\n`)
 
     const { code: code3 } = await esbuild.transform(`console.log(process['env'].NODE_ENV)`, { define })
-    assert.strictEqual(code3, `console.log("production");\n`)
+    assert.strictEqual(code3, `console.log("something");\n`)
 
     const { code: code4 } = await esbuild.transform(`console.log(process['env']['NODE_ENV'])`, { define })
-    assert.strictEqual(code4, `console.log("production");\n`)
+    assert.strictEqual(code4, `console.log("something");\n`)
+
+    const { code: code5 } = await esbuild.transform(`console.log(process.env.NODE_ENV)`, {})
+    assert.strictEqual(code5, `console.log(process.env.NODE_ENV);\n`)
+
+    const { code: code6 } = await esbuild.transform(`console.log(process.env.NODE_ENV)`, { platform: 'browser' })
+    assert.strictEqual(code6, `console.log(process.env.NODE_ENV);\n`)
   },
 
   async defineBuiltInConstants({ esbuild }) {
@@ -4731,8 +5854,14 @@ let transformTests = {
   },
 
   async dataurl({ esbuild }) {
-    const { code } = await esbuild.transform(`\x00\x01\x02`, { loader: 'dataurl' })
-    assert.strictEqual(code, `module.exports = "data:application/octet-stream;base64,AAEC";\n`)
+    const { code: code1 } = await esbuild.transform(`\x00\x01\x02`, { loader: 'dataurl' })
+    assert.strictEqual(code1, `module.exports = "data:application/octet-stream,%00%01%02";\n`)
+
+    const { code: code2 } = await esbuild.transform(`\xFD\xFE\xFF`, { loader: 'dataurl' })
+    assert.strictEqual(code2, `module.exports = "data:text/plain;charset=utf-8,\\xFD\\xFE\\xFF";\n`)
+
+    const { code: code3 } = await esbuild.transform(new Uint8Array([0xFD, 0xFE, 0xFF]), { loader: 'dataurl' })
+    assert.strictEqual(code3, `module.exports = "data:text/plain;charset=utf-8;base64,/f7/";\n`)
   },
 
   async sourceMapTrueWithName({ esbuild }) {
@@ -4925,19 +6054,20 @@ let transformTests = {
   async transformLegalCommentsJS({ esbuild }) {
     assert.strictEqual((await esbuild.transform(`//!x\ny()`, { legalComments: 'none' })).code, `y();\n`)
     assert.strictEqual((await esbuild.transform(`//!x\ny()`, { legalComments: 'inline' })).code, `//!x\ny();\n`)
-    assert.strictEqual((await esbuild.transform(`//!x\ny()`, { legalComments: 'eof' })).code, `y();\n//!x\n`)
+
+    const eofResult = await esbuild.transform(`//!x\ny()`, { legalComments: 'eof' })
+    assert.strictEqual(eofResult.code, `y();\n//!x\n`)
+    assert.strictEqual(eofResult.legalComments, undefined)
+
+    const externalResult = await esbuild.transform(`//!x\ny()`, { legalComments: 'external' })
+    assert.strictEqual(externalResult.code, `y();\n`)
+    assert.strictEqual(externalResult.legalComments, `//!x\n`)
+
     try {
       await esbuild.transform(``, { legalComments: 'linked' })
       throw new Error('Expected a transform failure')
     } catch (e) {
-      if (!e || !e.errors || !e.errors[0] || e.errors[0].text !== 'Cannot transform with linked or external legal comments')
-        throw e
-    }
-    try {
-      await esbuild.transform(``, { legalComments: 'external' })
-      throw new Error('Expected a transform failure')
-    } catch (e) {
-      if (!e || !e.errors || !e.errors[0] || e.errors[0].text !== 'Cannot transform with linked or external legal comments')
+      if (!e || !e.errors || !e.errors[0] || e.errors[0].text !== 'Cannot transform with linked legal comments')
         throw e
     }
   },
@@ -4945,19 +6075,20 @@ let transformTests = {
   async transformLegalCommentsCSS({ esbuild }) {
     assert.strictEqual((await esbuild.transform(`/*!x*/\ny{}`, { loader: 'css', legalComments: 'none' })).code, `y {\n}\n`)
     assert.strictEqual((await esbuild.transform(`/*!x*/\ny{}`, { loader: 'css', legalComments: 'inline' })).code, `/*!x*/\ny {\n}\n`)
-    assert.strictEqual((await esbuild.transform(`/*!x*/\ny{}`, { loader: 'css', legalComments: 'eof' })).code, `y {\n}\n/*!x*/\n`)
+
+    const eofResult = await esbuild.transform(`/*!x*/\ny{}`, { loader: 'css', legalComments: 'eof' })
+    assert.strictEqual(eofResult.code, `y {\n}\n/*!x*/\n`)
+    assert.strictEqual(eofResult.legalComments, undefined)
+
+    const externalResult = await esbuild.transform(`/*!x*/\ny{}`, { loader: 'css', legalComments: 'external' })
+    assert.strictEqual(externalResult.code, `y {\n}\n`)
+    assert.strictEqual(externalResult.legalComments, `/*!x*/\n`)
+
     try {
       await esbuild.transform(``, { legalComments: 'linked' })
       throw new Error('Expected a transform failure')
     } catch (e) {
-      if (!e || !e.errors || !e.errors[0] || e.errors[0].text !== 'Cannot transform with linked or external legal comments')
-        throw e
-    }
-    try {
-      await esbuild.transform(``, { legalComments: 'external' })
-      throw new Error('Expected a transform failure')
-    } catch (e) {
-      if (!e || !e.errors || !e.errors[0] || e.errors[0].text !== 'Cannot transform with linked or external legal comments')
+      if (!e || !e.errors || !e.errors[0] || e.errors[0].text !== 'Cannot transform with linked legal comments')
         throw e
     }
   },
@@ -5173,6 +6304,63 @@ let transformTests = {
     assert.strictEqual(fromPromiseResolve(code4), `Promise.resolve().then(function(){return __toESM(require(foo))});\n`)
   },
 
+  async inlineScript({ esbuild }) {
+    let p
+    assert.strictEqual((await esbuild.transform(`x = '</script>'`, {})).code, `x = "<\\/script>";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script> inline'`, { supported: { 'inline-script': true } })).code, `x = "<\\/script> inline";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script> noinline'`, { supported: { 'inline-script': false } })).code, `x = "</script> noinline";\n`)
+
+    p = { platform: 'browser' }
+    assert.strictEqual((await esbuild.transform(`x = '</script> browser'`, { ...p })).code, `x = "<\\/script> browser";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script> browser inline'`, { ...p, supported: { 'inline-script': true } })).code, `x = "<\\/script> browser inline";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script> browser noinline'`, { ...p, supported: { 'inline-script': false } })).code, `x = "</script> browser noinline";\n`)
+
+    p = { platform: 'node' }
+    assert.strictEqual((await esbuild.transform(`x = '</script> node'`, { ...p })).code, `x = "</script> node";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script> node inline'`, { ...p, supported: { 'inline-script': true } })).code, `x = "<\\/script> node inline";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script> node noinline'`, { ...p, supported: { 'inline-script': false } })).code, `x = "</script> node noinline";\n`)
+
+    p = { platform: 'neutral' }
+    assert.strictEqual((await esbuild.transform(`x = '</script> neutral'`, { ...p })).code, `x = "</script> neutral";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script> neutral inline'`, { ...p, supported: { 'inline-script': true } })).code, `x = "<\\/script> neutral inline";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script> neutral noinline'`, { ...p, supported: { 'inline-script': false } })).code, `x = "</script> neutral noinline";\n`)
+
+    assert.strictEqual((await esbuild.transform(`x = '</script>'`, { target: 'esnext' })).code, `x = "<\\/script>";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script>'`, { target: 'es2020' })).code, `x = "<\\/script>";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script>'`, { target: 'es6' })).code, `x = "<\\/script>";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script>'`, { target: 'chrome999' })).code, `x = "<\\/script>";\n`)
+    assert.strictEqual((await esbuild.transform(`x = '</script>'`, { target: 'chrome0' })).code, `x = "<\\/script>";\n`)
+  },
+
+  async inlineStyle({ esbuild }) {
+    let p = { loader: 'css' }
+    assert.strictEqual((await esbuild.transform(`x { y: '</style>' }`, { ...p })).code, `x {\n  y: "<\\/style>";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style> inline' }`, { ...p, supported: { 'inline-style': true } })).code, `x {\n  y: "<\\/style> inline";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style> noinline' }`, { ...p, supported: { 'inline-style': false } })).code, `x {\n  y: "</style> noinline";\n}\n`)
+
+    p = { loader: 'css', platform: 'browser' }
+    assert.strictEqual((await esbuild.transform(`x { y: '</style> browser' }`, { ...p })).code, `x {\n  y: "<\\/style> browser";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style> browser inline' }`, { ...p, supported: { 'inline-style': true } })).code, `x {\n  y: "<\\/style> browser inline";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style> browser noinline' }`, { ...p, supported: { 'inline-style': false } })).code, `x {\n  y: "</style> browser noinline";\n}\n`)
+
+    p = { loader: 'css', platform: 'node' }
+    assert.strictEqual((await esbuild.transform(`x { y: '</style> node' }`, { ...p })).code, `x {\n  y: "</style> node";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style> node inline' }`, { ...p, supported: { 'inline-style': true } })).code, `x {\n  y: "<\\/style> node inline";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style> node noinline' }`, { ...p, supported: { 'inline-style': false } })).code, `x {\n  y: "</style> node noinline";\n}\n`)
+
+    p = { loader: 'css', platform: 'neutral' }
+    assert.strictEqual((await esbuild.transform(`x { y: '</style> neutral' }`, { ...p })).code, `x {\n  y: "</style> neutral";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style> neutral inline' }`, { ...p, supported: { 'inline-style': true } })).code, `x {\n  y: "<\\/style> neutral inline";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style> neutral noinline' }`, { ...p, supported: { 'inline-style': false } })).code, `x {\n  y: "</style> neutral noinline";\n}\n`)
+
+    p = { loader: 'css' }
+    assert.strictEqual((await esbuild.transform(`x { y: '</style>' }`, { ...p, target: 'esnext' })).code, `x {\n  y: "<\\/style>";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style>' }`, { ...p, target: 'es2020' })).code, `x {\n  y: "<\\/style>";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style>' }`, { ...p, target: 'es6' })).code, `x {\n  y: "<\\/style>";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style>' }`, { ...p, target: 'chrome999' })).code, `x {\n  y: "<\\/style>";\n}\n`)
+    assert.strictEqual((await esbuild.transform(`x { y: '</style>' }`, { ...p, target: 'chrome0' })).code, `x {\n  y: "<\\/style>";\n}\n`)
+  },
+
   async typeofEqualsUndefinedTarget({ esbuild }) {
     assert.strictEqual((await esbuild.transform(`a = typeof b !== 'undefined'`, { minify: true })).code, `a=typeof b<"u";\n`)
     assert.strictEqual((await esbuild.transform(`a = typeof b !== 'undefined'`, { minify: true, target: 'es2020' })).code, `a=typeof b<"u";\n`)
@@ -5281,6 +6469,10 @@ let transformTests = {
       // RegExpMatchIndices
       check('es2022', `x1 = /y/d`, `x1 = /y/d;\n`),
       check('es2021', `x2 = /y/d`, `x2 = new RegExp("y", "d");\n`),
+
+      // RegExpSetNotation
+      check('esnext', `x1 = /[\\p{White_Space}&&\\p{ASCII}]/v`, `x1 = /[\\p{White_Space}&&\\p{ASCII}]/v;\n`),
+      check('es2022', `x2 = /[\\p{White_Space}&&\\p{ASCII}]/v`, `x2 = new RegExp("[\\\\p{White_Space}&&\\\\p{ASCII}]", "v");\n`),
     ])
   },
 
@@ -5519,7 +6711,7 @@ let syncTests = {
     const input = path.join(testDir, 'in.js')
     const output = path.join(testDir, 'out.js')
     await writeFileAsync(input, 'module.exports = 123')
-    let prettyPath = path.relative(process.cwd(), input).replace(/\\/g, '/')
+    let prettyPath = path.relative(process.cwd(), input).split(path.sep).join('/')
     let text = `// ${prettyPath}\nmodule.exports = 123;\n`
     let result = esbuild.buildSync({ entryPoints: [input], bundle: true, outfile: output, format: 'cjs', write: false })
     assert.strictEqual(result.outputFiles.length, 1)
@@ -5588,43 +6780,7 @@ let syncTests = {
     } catch (error) {
       assert(error instanceof Error, 'Must be an Error object');
       assert.strictEqual(error.message, `Build failed with 1 error:
-${path.relative(process.cwd(), input).replace(/\\/g, '/')}:1:2: ERROR: Unexpected end of file`);
-      assert.strictEqual(error.errors.length, 1);
-      assert.strictEqual(error.warnings.length, 0);
-    }
-  },
-
-  async buildSyncIncrementalThrow({ esbuild, testDir }) {
-    try {
-      const input = path.join(testDir, 'in.js')
-      const output = path.join(testDir, 'out.js')
-      await writeFileAsync(input, '1+')
-      esbuild.buildSync({ entryPoints: [input], bundle: true, outfile: output, format: 'cjs', logLevel: 'silent', incremental: true })
-      const result = require(output)
-      assert.strictEqual(result.default, 123)
-      assert.strictEqual(result.__esModule, true)
-      throw new Error('Expected an error to be thrown');
-    } catch (error) {
-      assert(error instanceof Error, 'Must be an Error object');
-      assert.strictEqual(error.message, `Build failed with 1 error:\nerror: Cannot use "incremental" with a synchronous build`);
-      assert.strictEqual(error.errors.length, 1);
-      assert.strictEqual(error.warnings.length, 0);
-    }
-  },
-
-  async buildSyncWatchThrow({ esbuild, testDir }) {
-    try {
-      const input = path.join(testDir, 'in.js')
-      const output = path.join(testDir, 'out.js')
-      await writeFileAsync(input, '1+')
-      esbuild.buildSync({ entryPoints: [input], bundle: true, outfile: output, format: 'cjs', logLevel: 'silent', watch: true })
-      const result = require(output)
-      assert.strictEqual(result.default, 123)
-      assert.strictEqual(result.__esModule, true)
-      throw new Error('Expected an error to be thrown');
-    } catch (error) {
-      assert(error instanceof Error, 'Must be an Error object');
-      assert.strictEqual(error.message, `Build failed with 1 error:\nerror: Cannot use "watch" with a synchronous build`);
+${path.relative(process.cwd(), input).split(path.sep).join('/')}:1:2: ERROR: Unexpected end of file`);
       assert.strictEqual(error.errors.length, 1);
       assert.strictEqual(error.warnings.length, 0);
     }
@@ -5702,6 +6858,154 @@ ${path.relative(process.cwd(), input).replace(/\\/g, '/')}:1:2: ERROR: Unexpecte
   },
 }
 
+let childProcessTests = {
+  // More info about this test case: https://github.com/evanw/esbuild/issues/2727
+  async testIncrementalChildProcessExit({ testDir, esbuild }) {
+    const file = path.join(testDir, 'build.js')
+
+    await writeFileAsync(file, `
+      const esbuild = require(${JSON.stringify(esbuild.ESBUILD_PACKAGE_PATH)})
+      esbuild.context({
+        entryPoints: [],
+      })
+      .then(context => context.rebuild())
+      .then(() => {
+        console.log('success')
+        process.exit(0)
+      })
+    `)
+
+    let timeout
+    const detectHangPromise = new Promise((_, reject) => {
+      timeout = setTimeout(() => {
+        reject(new Error('Timed out waiting for keep-alive check to terminate'))
+      }, 5 * 60 * 1000)
+    })
+
+    const testKeepAlivePingPromise = new Promise((resolve, reject) => {
+      child_process.execFile('node', [file], {
+        stdio: [
+          'inherit',
+          'inherit',
+          'pipe', // This is important for the test to check for the hang
+        ],
+      }, (error, stdout, stderr) => {
+        clearTimeout(timeout)
+        if (error) reject(error)
+        else if (stdout !== 'success\n') reject(new Error('Unexpected stdout: ' + JSON.stringify(stdout)))
+        else if (stderr !== '') reject(new Error('Unexpected stderr: ' + JSON.stringify(stderr)))
+        else resolve()
+      })
+    })
+
+    await Promise.race([
+      detectHangPromise,
+      testKeepAlivePingPromise,
+    ])
+  },
+
+  async testWatchStdoutChildProcess({ testDir, esbuild }) {
+    const sequence = [
+      {
+        input: 'console.log(1+2)',
+        stdout: ['console.log(1 + 2);'],
+        stderr: ['[watch] build finished, watching for changes...'],
+      },
+      {
+        input: 'console.log(2+3)',
+        stdout: ['console.log(2 + 3);'],
+        stderr: ['[watch] build started (change: "in.js")', '[watch] build finished'],
+      },
+      {
+        input: 'console.log(3+4)',
+        stdout: ['console.log(3 + 4);'],
+        stderr: ['[watch] build started (change: "in.js")', '[watch] build finished'],
+      },
+    ]
+
+    const infile = path.join(testDir, 'in.js')
+    const file = path.join(testDir, 'build.js')
+    await writeFileAsync(infile, sequence[0].input)
+    await writeFileAsync(file, `
+      const esbuild = require(${JSON.stringify(esbuild.ESBUILD_PACKAGE_PATH)})
+      esbuild.context({
+        entryPoints: [${JSON.stringify(infile)}],
+        logLevel: 'info',
+      }).then(ctx => ctx.watch())
+    `)
+
+    // Start the child
+    const maxSeconds = 60
+    const child = child_process.spawn('node', [file], {
+      cwd: testDir,
+      stdio: ['inherit', 'pipe', 'pipe'],
+      timeout: maxSeconds * 1000,
+    })
+
+    // Make sure the child is always killed
+    try {
+      for (const { input, stdout: expectedStdout, stderr: expectedStderr } of sequence) {
+        let totalStdout = ''
+        let totalStderr = ''
+        let stdoutBuffer = ''
+        let stderrBuffer = ''
+        const onstdout = data => {
+          totalStdout += data
+          stdoutBuffer += data
+          check()
+        }
+        const onstderr = data => {
+          totalStderr += data
+          stderrBuffer += data
+          check()
+        }
+        let check = () => { }
+
+        child.stdout.on('data', onstdout)
+        child.stderr.on('data', onstderr)
+
+        await new Promise((resolve, reject) => {
+          const seconds = 30
+          const timeout = setTimeout(() => reject(new Error(
+            `Watch mode + stdout test failed to match expected output after ${seconds} seconds
+  input: ${JSON.stringify(input)}
+  stdout: ${JSON.stringify(totalStdout)}
+  stderr: ${JSON.stringify(totalStderr)}
+`)), seconds * 1000)
+
+          check = () => {
+            let index
+
+            while ((index = stdoutBuffer.indexOf('\n')) >= 0) {
+              const line = stdoutBuffer.slice(0, index)
+              stdoutBuffer = stdoutBuffer.slice(index + 1)
+              if (line === expectedStdout[0]) expectedStdout.shift()
+            }
+
+            while ((index = stderrBuffer.indexOf('\n')) >= 0) {
+              const line = stderrBuffer.slice(0, index)
+              stderrBuffer = stderrBuffer.slice(index + 1)
+              if (line === expectedStderr[0]) expectedStderr.shift()
+            }
+
+            if (!expectedStdout.length && !expectedStderr.length) {
+              clearTimeout(timeout)
+              resolve()
+            }
+          }
+
+          writeFileAtomic(infile, input)
+        })
+
+        child.stdout.off('data', onstdout)
+        child.stderr.off('data', onstderr)
+      }
+    } finally {
+      child.kill()
+    }
+  },
+}
+
 async function assertSourceMap(jsSourceMap, source) {
   jsSourceMap = JSON.parse(jsSourceMap)
   assert.deepStrictEqual(jsSourceMap.version, 3)
@@ -5725,7 +7029,7 @@ async function main() {
   }, minutes * 60 * 1000)
 
   // Run all tests concurrently
-  const runTest = async ([name, fn]) => {
+  const runTest = async (name, fn) => {
     let testDir = path.join(rootTestDir, name)
     try {
       await mkdirAsync(testDir)
@@ -5737,6 +7041,7 @@ async function main() {
       return false
     }
   }
+
   const tests = [
     ...Object.entries(buildTests),
     ...Object.entries(watchTests),
@@ -5745,8 +7050,20 @@ async function main() {
     ...Object.entries(formatTests),
     ...Object.entries(analyzeTests),
     ...Object.entries(syncTests),
+    ...Object.entries(childProcessTests),
   ]
-  let allTestsPassed = (await Promise.all(tests.map(runTest))).every(success => success)
+
+  const allTestsPassed = (await Promise.all(tests.map(([name, fn]) => {
+    const promise = runTest(name, fn)
+
+    // Time out each individual test after 3 minutes. This exists to help debug test hangs in CI.
+    const minutes = 3
+    const timeout = setTimeout(() => {
+      console.error(`❌ the test "${name}" timed out after ${minutes} minutes, exiting...`)
+      process.exit(1)
+    }, minutes * 60 * 1000)
+    return promise.finally(() => clearTimeout(timeout))
+  }))).every(success => success)
 
   if (!allTestsPassed) {
     console.error(`❌ js api tests failed`)

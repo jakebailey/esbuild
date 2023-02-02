@@ -248,11 +248,6 @@ type LocRef struct {
 	Ref Ref
 }
 
-type Comment struct {
-	Text string
-	Loc  logger.Loc
-}
-
 type PropertyKind uint8
 
 const (
@@ -304,15 +299,18 @@ type Property struct {
 
 	TSDecorators []Expr
 
-	Loc   logger.Loc
-	Kind  PropertyKind
-	Flags PropertyFlags
+	Loc             logger.Loc
+	CloseBracketLoc logger.Loc
+	Kind            PropertyKind
+	Flags           PropertyFlags
 }
 
 type PropertyBinding struct {
 	Key               Expr
 	Value             Binding
 	DefaultValueOrNil Expr
+	Loc               logger.Loc
+	CloseBracketLoc   logger.Loc
 	IsComputed        bool
 	IsSpread          bool
 	PreferQuotedKey   bool
@@ -361,6 +359,7 @@ type Class struct {
 type ArrayBinding struct {
 	Binding           Binding
 	DefaultValueOrNil Expr
+	Loc               logger.Loc
 }
 
 type Binding struct {
@@ -453,6 +452,39 @@ type EArray struct {
 type EUnary struct {
 	Value Expr
 	Op    OpCode
+
+	// The expression "typeof (0, x)" must not become "typeof x" if "x"
+	// is unbound because that could suppress a ReferenceError from "x".
+	//
+	// Also if we know a typeof operator was originally an identifier, then
+	// we know that this typeof operator always has no side effects (even if
+	// we consider the identifier by itself to have a side effect).
+	//
+	// Note that there *is* actually a case where "typeof x" can throw an error:
+	// when "x" is being referenced inside of its TDZ (temporal dead zone). TDZ
+	// checks are not yet handled correctly by esbuild, so this possibility is
+	// currently ignored.
+	WasOriginallyTypeofIdentifier bool
+
+	// Similarly the expression "delete (0, x)" must not become "delete x"
+	// because that syntax is invalid in strict mode. We also need to make sure
+	// we don't accidentally change the return value:
+	//
+	//   Returns false:
+	//     "var a; delete (a)"
+	//     "var a = Object.freeze({b: 1}); delete (a.b)"
+	//     "var a = Object.freeze({b: 1}); delete (a?.b)"
+	//     "var a = Object.freeze({b: 1}); delete (a['b'])"
+	//     "var a = Object.freeze({b: 1}); delete (a?.['b'])"
+	//
+	//   Returns true:
+	//     "var a; delete (0, a)"
+	//     "var a = Object.freeze({b: 1}); delete (true && a.b)"
+	//     "var a = Object.freeze({b: 1}); delete (false || a?.b)"
+	//     "var a = Object.freeze({b: 1}); delete (null ?? a?.['b'])"
+	//     "var a = Object.freeze({b: 1}); delete (true ? a['b'] : a['b'])"
+	//
+	WasOriginallyDeleteOfIdentifierOrPropertyAccess bool
 }
 
 type EBinary struct {
@@ -492,8 +524,9 @@ var SEmptyShared = &SEmpty{}
 var SDebuggerShared = &SDebugger{}
 
 type ENew struct {
-	Target        Expr
-	Args          []Expr
+	Target Expr
+	Args   []Expr
+
 	CloseParenLoc logger.Loc
 	IsMultiLine   bool
 
@@ -501,6 +534,15 @@ type ENew struct {
 	// this call expression. See the comment inside ECall for more details.
 	CanBeUnwrappedIfUnused bool
 }
+
+type CallKind uint8
+
+const (
+	NormalCall CallKind = iota
+	DirectEval
+	TargetWasOriginallyPropertyAccess
+	InternalPublicFieldCall
+)
 
 type OptionalChain uint8
 
@@ -521,7 +563,7 @@ type ECall struct {
 	Args          []Expr
 	CloseParenLoc logger.Loc
 	OptionalChain OptionalChain
-	IsDirectEval  bool
+	Kind          CallKind
 	IsMultiLine   bool
 
 	// True if there is a comment containing "@__PURE__" or "#__PURE__" preceding
@@ -537,7 +579,7 @@ type ECall struct {
 
 func (a *ECall) HasSameFlagsAs(b *ECall) bool {
 	return a.OptionalChain == b.OptionalChain &&
-		a.IsDirectEval == b.IsDirectEval &&
+		a.Kind == b.Kind &&
 		a.CanBeUnwrappedIfUnused == b.CanBeUnwrappedIfUnused
 }
 
@@ -564,9 +606,10 @@ func (a *EDot) HasSameFlagsAs(b *EDot) bool {
 }
 
 type EIndex struct {
-	Target        Expr
-	Index         Expr
-	OptionalChain OptionalChain
+	Target          Expr
+	Index           Expr
+	CloseBracketLoc logger.Loc
+	OptionalChain   OptionalChain
 
 	// If true, this property access is known to be free of side-effects. That
 	// means it can be removed if the resulting value isn't used.
@@ -660,10 +703,11 @@ type EMangledProp struct {
 }
 
 type EJSXElement struct {
-	TagOrNil   Expr
-	Properties []Property
-	Children   []Expr
-	CloseLoc   logger.Loc
+	TagOrNil        Expr
+	Properties      []Property
+	Children        []Expr
+	CloseLoc        logger.Loc
+	IsTagSingleLine bool
 }
 
 type ENumber struct{ Value float64 }
@@ -702,6 +746,14 @@ type ETemplate struct {
 	Parts          []TemplatePart
 	HeadLoc        logger.Loc
 	LegacyOctalLoc logger.Loc
+
+	// If the tag is present, it is expected to be a function and is called. If
+	// the tag is a syntactic property access, then the value for "this" in the
+	// function call is the object whose property was accessed (e.g. in "a.b``"
+	// the value for "this" in "a.b" is "a"). We need to ensure that if "a``"
+	// ever becomes "b.c``" later on due to optimizations, it is written as
+	// "(0, b.c)``" to avoid a behavior change.
+	TagWasOriginallyPropertyAccess bool
 }
 
 type ERegExp struct{ Value string }
@@ -728,31 +780,23 @@ type EIf struct {
 
 type ERequireString struct {
 	ImportRecordIndex uint32
+	CloseParenLoc     logger.Loc
 }
 
 type ERequireResolveString struct {
 	ImportRecordIndex uint32
+	CloseParenLoc     logger.Loc
 }
 
 type EImportString struct {
-	// Comments inside "import()" expressions have special meaning for Webpack.
-	// Preserving comments inside these expressions makes it possible to use
-	// esbuild as a TypeScript-to-JavaScript frontend for Webpack to improve
-	// performance. We intentionally do not interpret these comments in esbuild
-	// because esbuild is not Webpack. But we do preserve them since doing so is
-	// harmless, easy to maintain, and useful to people. See the Webpack docs for
-	// more info: https://webpack.js.org/api/module-methods/#magic-comments.
-	LeadingInteriorComments []Comment
-
 	ImportRecordIndex uint32
+	CloseParenLoc     logger.Loc
 }
 
 type EImportCall struct {
-	Expr         Expr
-	OptionsOrNil Expr
-
-	// See the comment for this same field on "EImportString" for more information
-	LeadingInteriorComments []Comment
+	Expr          Expr
+	OptionsOrNil  Expr
+	CloseParenLoc logger.Loc
 }
 
 type Stmt struct {
@@ -928,10 +972,10 @@ type SForIn struct {
 }
 
 type SForOf struct {
-	Init    Stmt // May be a SConst, SLet, SVar, or SExpr
-	Value   Expr
-	Body    Stmt
-	IsAwait bool
+	Init  Stmt // May be a SConst, SLet, SVar, or SExpr
+	Value Expr
+	Body  Stmt
+	Await logger.Range
 }
 
 type SDoWhile struct {
@@ -1496,6 +1540,7 @@ type Scope struct {
 	Parent    *Scope
 	Children  []*Scope
 	Members   map[string]ScopeMember
+	Replaced  []ScopeMember
 	Generated []Ref
 
 	// The location of the "use strict" directive for ExplicitStrictMode
@@ -1773,6 +1818,7 @@ type AST struct {
 	ModuleTypeData ModuleTypeData
 	Parts          []Part
 	Symbols        []Symbol
+	ExprComments   map[logger.Loc][]string
 	ModuleScope    *Scope
 	CharFreq       *CharFreq
 
@@ -1821,8 +1867,9 @@ type AST struct {
 
 	// This is a list of ES6 features. They are ranges instead of booleans so
 	// that they can be used in log messages. Check to see if "Len > 0".
-	ExportKeyword        logger.Range // Does not include TypeScript-specific syntax
-	TopLevelAwaitKeyword logger.Range
+	ExportKeyword            logger.Range // Does not include TypeScript-specific syntax
+	TopLevelAwaitKeyword     logger.Range
+	LiveTopLevelAwaitKeyword logger.Range // Excludes top-level await in dead branches
 
 	ExportsRef Ref
 	ModuleRef  Ref

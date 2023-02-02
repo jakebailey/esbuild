@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: ['*']
 
+permissions:
+  contents: read  #  to fetch code (actions/checkout)
+
 jobs:
   esbuild-slow:
     # Split these out into their own runner because they're very slow
@@ -16,7 +19,7 @@ jobs:
       - name: Set up Go 1.x
         uses: actions/setup-go@v3
         with:
-          go-version: 1.19.2
+          go-version: 1.19.5
         id: go
 
       - name: Setup Node.js environment
@@ -47,7 +50,7 @@ jobs:
       - name: Set up Go 1.x
         uses: actions/setup-go@v3
         with:
-          go-version: 1.19.2
+          go-version: 1.19.5
         id: go
 
       - name: Setup Node.js environment
@@ -160,7 +163,7 @@ jobs:
         run: cd scripts && node gen-unicode-table.js
 
   esbuild-old-golang:
-    name: esbuild CI (old Go version)
+    name: esbuild CI (old versions)
     runs-on: ubuntu-latest
 
     steps:
@@ -178,3 +181,6 @@ jobs:
 
       - name: go test
         run: go test ./internal/...
+
+      - name: make test-old-ts
+        run: make test-old-ts

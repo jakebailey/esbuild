@@ -1,6 +1,11 @@
 package logger
 
-// Logging is currently designed to look and feel like clang's error format.
+// Logging is either done to stderr (via "NewStderrLog") or to an in-memory
+// array (via "NewDeferLog"). In-memory arrays are used to capture messages
+// from parsing individual files because during incremental builds, log
+// messages for a given file can be replayed from memory if the file ends up
+// not being reparsed.
+//
 // Errors are streamed asynchronously as they happen, each error contains the
 // contents of the line with the error, and the error count is limited by
 // default.
@@ -21,11 +26,7 @@ const defaultTerminalWidth = 80
 type Log struct {
 	AddMsg    func(Msg)
 	HasErrors func() bool
-
-	// This is called after the build has finished but before writing to stdout.
-	// It exists to ensure that deferred warning messages end up in the terminal
-	// before the data written to stdout.
-	AlmostDone func()
+	Peek      func() []Msg
 
 	Done func() []Msg
 
@@ -133,11 +134,8 @@ func isProbablyWindowsCommandPrompt() bool {
 		// because that means we're running in the new Windows Terminal instead.
 		if runtime.GOOS == "windows" {
 			windowsCommandPrompt.isProbablyCMD = true
-			for _, env := range os.Environ() {
-				if strings.HasPrefix(env, "WT_SESSION=") {
-					windowsCommandPrompt.isProbablyCMD = false
-					break
-				}
+			if _, ok := os.LookupEnv("WT_SESSION"); ok {
+				windowsCommandPrompt.isProbablyCMD = false
 			}
 		}
 	}
@@ -261,12 +259,10 @@ var noColorOnce sync.Once
 
 func hasNoColorEnvironmentVariable() bool {
 	noColorOnce.Do(func() {
-		for _, key := range os.Environ() {
-			// Read "NO_COLOR" from the environment. This is a convention that some
-			// software follows. See https://no-color.org/ for more information.
-			if strings.HasPrefix(key, "NO_COLOR=") {
-				noColorResult = true
-			}
+		// Read "NO_COLOR" from the environment. This is a convention that some
+		// software follows. See https://no-color.org/ for more information.
+		if _, ok := os.LookupEnv("NO_COLOR"); ok {
+			noColorResult = true
 		}
 	})
 	return noColorResult
@@ -455,6 +451,74 @@ func (s *Source) RangeOfLegacyOctalEscape(loc Loc) (r Range) {
 	return
 }
 
+func (s *Source) CommentTextWithoutIndent(r Range) string {
+	text := s.Contents[r.Loc.Start:r.End()]
+	if len(text) < 2 || !strings.HasPrefix(text, "/*") {
+		return text
+	}
+	prefix := s.Contents[:r.Loc.Start]
+
+	// Figure out the initial indent
+	indent := 0
+seekBackwardToNewline:
+	for len(prefix) > 0 {
+		c, size := utf8.DecodeLastRuneInString(prefix)
+		switch c {
+		case '\r', '\n', '\u2028', '\u2029':
+			break seekBackwardToNewline
+		}
+		prefix = prefix[:len(prefix)-size]
+		indent++
+	}
+
+	// Split the comment into lines
+	var lines []string
+	start := 0
+	for i, c := range text {
+		switch c {
+		case '\r', '\n':
+			// Don't double-append for Windows style "\r\n" newlines
+			if start <= i {
+				lines = append(lines, text[start:i])
+			}
+
+			start = i + 1
+
+			// Ignore the second part of Windows style "\r\n" newlines
+			if c == '\r' && start < len(text) && text[start] == '\n' {
+				start++
+			}
+
+		case '\u2028', '\u2029':
+			lines = append(lines, text[start:i])
+			start = i + 3
+		}
+	}
+	lines = append(lines, text[start:])
+
+	// Find the minimum indent over all lines after the first line
+	for _, line := range lines[1:] {
+		lineIndent := 0
+		for _, c := range line {
+			if c != ' ' && c != '\t' {
+				break
+			}
+			lineIndent++
+		}
+		if indent > lineIndent {
+			indent = lineIndent
+		}
+	}
+
+	// Trim the indent off of all lines after the first line
+	for i, line := range lines {
+		if i > 0 {
+			lines[i] = line[indent:]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func plural(prefix string, count int, shown int, someAreMissing bool) string {
 	var text string
 	if count == 1 {
@@ -516,14 +580,8 @@ func NewStderrLog(options OutputOptions) Log {
 		remainingMessagesBeforeLimit = 0x7FFFFFFF
 	}
 	var deferredWarnings []Msg
-	didFinalizeLog := false
 
 	finalizeLog := func() {
-		if didFinalizeLog {
-			return
-		}
-		didFinalizeLog = true
-
 		// Print the deferred warning now if there was no error after all
 		for remainingMessagesBeforeLimit > 0 && len(deferredWarnings) > 0 {
 			shownWarnings++
@@ -622,17 +680,16 @@ func NewStderrLog(options OutputOptions) Log {
 			return hasErrors
 		},
 
-		AlmostDone: func() {
+		Peek: func() []Msg {
 			mutex.Lock()
 			defer mutex.Unlock()
-
-			finalizeLog()
+			sort.Stable(msgs)
+			return append([]Msg{}, msgs...)
 		},
 
 		Done: func() []Msg {
 			mutex.Lock()
 			defer mutex.Unlock()
-
 			finalizeLog()
 			sort.Stable(msgs)
 			return msgs
@@ -642,6 +699,17 @@ func NewStderrLog(options OutputOptions) Log {
 
 func PrintErrorToStderr(osArgs []string, text string) {
 	PrintMessageToStderr(osArgs, Msg{Kind: Error, Data: MsgData{Text: text}})
+}
+
+func PrintErrorWithNoteToStderr(osArgs []string, text string, note string) {
+	msg := Msg{
+		Kind: Error,
+		Data: MsgData{Text: text},
+	}
+	if note != "" {
+		msg.Notes = []MsgData{{Text: note}}
+	}
+	PrintMessageToStderr(osArgs, msg)
 }
 
 func OutputOptionsForArgs(osArgs []string) OutputOptions {
@@ -990,7 +1058,10 @@ func NewDeferLog(kind DeferLogKind, overrides map[MsgID]LogLevel) Log {
 			return hasErrors
 		},
 
-		AlmostDone: func() {
+		Peek: func() []Msg {
+			mutex.Lock()
+			defer mutex.Unlock()
+			return append([]Msg{}, msgs...)
 		},
 
 		Done: func() []Msg {
@@ -1150,7 +1221,7 @@ func msgString(includeSource bool, terminalInfo TerminalInfo, id MsgID, kind Msg
 	}
 
 	if pluginName != "" {
-		pluginName = fmt.Sprintf("%s%s[plugin %s]%s ", colors.Bold, colors.Magenta, pluginName, colors.Reset)
+		pluginName = fmt.Sprintf(" %s%s[plugin %s]%s", colors.Bold, colors.Magenta, pluginName, colors.Reset)
 	}
 
 	msgID := MsgIDToString(id)
@@ -1161,8 +1232,7 @@ func msgString(includeSource bool, terminalInfo TerminalInfo, id MsgID, kind Msg
 	return fmt.Sprintf("%s%s %s[%s%s%s]%s %s%s%s%s%s\n%s",
 		iconColor, kind.Icon(),
 		kindColorBrackets, kindColorText, kind.String(), kindColorBrackets, colors.Reset,
-		pluginName,
-		colors.Bold, data.Text, colors.Reset, msgID,
+		colors.Bold, data.Text, colors.Reset, pluginName, msgID,
 		location,
 	)
 }

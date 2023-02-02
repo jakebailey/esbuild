@@ -179,7 +179,10 @@ func TestTSTypes(t *testing.T) {
 	expectPrintedTS(t, "type Foo = \n & a.b \n & c.d", "")
 	expectPrintedTS(t, "type Foo = Bar extends [infer T] ? T : null", "")
 	expectPrintedTS(t, "type Foo = Bar extends [infer T extends string] ? T : null", "")
+	expectPrintedTS(t, "type Foo = {} extends infer T extends {} ? A<T> : never", "")
+	expectPrintedTS(t, "type Foo = {} extends (infer T extends {}) ? A<T> : never", "")
 	expectPrintedTS(t, "let x: A extends B<infer C extends D> ? D : never", "let x;\n")
+	expectPrintedTS(t, "let x: A extends B<infer C extends D ? infer C : never> ? D : never", "let x;\n")
 
 	expectPrintedTS(t, "let x: A.B<X.Y>", "let x;\n")
 	expectPrintedTS(t, "let x: A.B<X.Y>=2", "let x = 2;\n")
@@ -293,8 +296,7 @@ func TestTSTypes(t *testing.T) {
 
 	// TypeScript 4.7
 	jsxErrorArrow := "<stdin>: ERROR: The character \">\" is not valid inside a JSX element\n" +
-		"NOTE: Did you mean to escape it as \"{'>'}\" instead?\n" +
-		"<stdin>: ERROR: Unexpected end of file\n"
+		"NOTE: Did you mean to escape it as \"{'>'}\" instead?\n"
 	expectPrintedTS(t, "type Foo<in T> = T", "")
 	expectPrintedTS(t, "type Foo<out T> = T", "")
 	expectPrintedTS(t, "type Foo<in out> = T", "")
@@ -335,8 +337,10 @@ func TestTSTypes(t *testing.T) {
 	expectParseErrorTS(t, "declare function foo<out T>()", "<stdin>: ERROR: The modifier \"out\" is not valid here:\n")
 	expectParseErrorTS(t, "declare let foo: Foo<in T>", "<stdin>: ERROR: Unexpected \"in\"\n")
 	expectParseErrorTS(t, "declare let foo: Foo<out T>", "<stdin>: ERROR: Expected \">\" but found \"T\"\n")
-	expectParseErrorTS(t, "Foo = class <in T> {}", "<stdin>: ERROR: The modifier \"in\" is not valid here:\n")
-	expectParseErrorTS(t, "Foo = class <out T> {}", "<stdin>: ERROR: The modifier \"out\" is not valid here:\n")
+	expectPrintedTS(t, "Foo = class <in T> {}", "Foo = class {\n};\n")
+	expectPrintedTS(t, "Foo = class <out T> {}", "Foo = class {\n};\n")
+	expectPrintedTS(t, "Foo = class Bar<in T> {}", "Foo = class Bar {\n};\n")
+	expectPrintedTS(t, "Foo = class Bar<out T> {}", "Foo = class Bar {\n};\n")
 	expectParseErrorTS(t, "foo = function <in T>() {}", "<stdin>: ERROR: The modifier \"in\" is not valid here:\n")
 	expectParseErrorTS(t, "foo = function <out T>() {}", "<stdin>: ERROR: The modifier \"out\" is not valid here:\n")
 	expectParseErrorTS(t, "class Foo { foo<in T>(): T {} }", "<stdin>: ERROR: The modifier \"in\" is not valid here:\n")
@@ -355,22 +359,89 @@ func TestTSTypes(t *testing.T) {
 	expectParseErrorTS(t, "let x: { y<in T>(): any }", "<stdin>: ERROR: The modifier \"in\" is not valid here:\n")
 	expectParseErrorTS(t, "let x: { y<out T>(): any }", "<stdin>: ERROR: The modifier \"out\" is not valid here:\n")
 	expectParseErrorTS(t, "let x: { y<in T, out T>(): any }", "<stdin>: ERROR: The modifier \"in\" is not valid here:\n<stdin>: ERROR: The modifier \"out\" is not valid here:\n")
-	expectPrintedTSX(t, "<in T></in>", "/* @__PURE__ */ React.createElement(\"in\", {\n  T: true\n});\n")
-	expectPrintedTSX(t, "<out T></out>", "/* @__PURE__ */ React.createElement(\"out\", {\n  T: true\n});\n")
-	expectPrintedTSX(t, "<in out T></in>", "/* @__PURE__ */ React.createElement(\"in\", {\n  out: true,\n  T: true\n});\n")
-	expectPrintedTSX(t, "<out in T></out>", "/* @__PURE__ */ React.createElement(\"out\", {\n  in: true,\n  T: true\n});\n")
-	expectPrintedTSX(t, "<in T extends={true}></in>", "/* @__PURE__ */ React.createElement(\"in\", {\n  T: true,\n  extends: true\n});\n")
-	expectPrintedTSX(t, "<out T extends={true}></out>", "/* @__PURE__ */ React.createElement(\"out\", {\n  T: true,\n  extends: true\n});\n")
-	expectPrintedTSX(t, "<in out T extends={true}></in>", "/* @__PURE__ */ React.createElement(\"in\", {\n  out: true,\n  T: true,\n  extends: true\n});\n")
+	expectPrintedTSX(t, "<in T></in>", "/* @__PURE__ */ React.createElement(\"in\", { T: true });\n")
+	expectPrintedTSX(t, "<out T></out>", "/* @__PURE__ */ React.createElement(\"out\", { T: true });\n")
+	expectPrintedTSX(t, "<in out T></in>", "/* @__PURE__ */ React.createElement(\"in\", { out: true, T: true });\n")
+	expectPrintedTSX(t, "<out in T></out>", "/* @__PURE__ */ React.createElement(\"out\", { in: true, T: true });\n")
+	expectPrintedTSX(t, "<in T extends={true}></in>", "/* @__PURE__ */ React.createElement(\"in\", { T: true, extends: true });\n")
+	expectPrintedTSX(t, "<out T extends={true}></out>", "/* @__PURE__ */ React.createElement(\"out\", { T: true, extends: true });\n")
+	expectPrintedTSX(t, "<in out T extends={true}></in>", "/* @__PURE__ */ React.createElement(\"in\", { out: true, T: true, extends: true });\n")
 	expectParseErrorTSX(t, "<in T,>() => {}", "<stdin>: ERROR: Expected \">\" but found \",\"\n")
 	expectParseErrorTSX(t, "<out T,>() => {}", "<stdin>: ERROR: Expected \">\" but found \",\"\n")
 	expectParseErrorTSX(t, "<in out T,>() => {}", "<stdin>: ERROR: Expected \">\" but found \",\"\n")
-	expectParseErrorTSX(t, "<in T extends any>() => {}", jsxErrorArrow)
-	expectParseErrorTSX(t, "<out T extends any>() => {}", jsxErrorArrow)
-	expectParseErrorTSX(t, "<in out T extends any>() => {}", jsxErrorArrow)
+	expectParseErrorTSX(t, "<in T extends any>() => {}", jsxErrorArrow+"<stdin>: ERROR: Unexpected end of file before a closing \"in\" tag\n<stdin>: NOTE: The opening \"in\" tag is here:\n")
+	expectParseErrorTSX(t, "<out T extends any>() => {}", jsxErrorArrow+"<stdin>: ERROR: Unexpected end of file before a closing \"out\" tag\n<stdin>: NOTE: The opening \"out\" tag is here:\n")
+	expectParseErrorTSX(t, "<in out T extends any>() => {}", jsxErrorArrow+"<stdin>: ERROR: Unexpected end of file before a closing \"in\" tag\n<stdin>: NOTE: The opening \"in\" tag is here:\n")
 	expectPrintedTS(t, "class Container { get data(): typeof this.#data {} }", "class Container {\n  get data() {\n  }\n}\n")
 	expectPrintedTS(t, "const a: typeof this.#a = 1;", "const a = 1;\n")
 	expectParseErrorTS(t, "const a: typeof #a = 1;", "<stdin>: ERROR: Expected identifier but found \"#a\"\n")
+
+	// TypeScript 5.0
+	expectPrintedTS(t, "class Foo<const T> {}", "class Foo {\n}\n")
+	expectPrintedTS(t, "class Foo<const T extends X> {}", "class Foo {\n}\n")
+	expectPrintedTS(t, "Foo = class <const T> {}", "Foo = class {\n};\n")
+	expectPrintedTS(t, "Foo = class Bar<const T> {}", "Foo = class Bar {\n};\n")
+	expectPrintedTS(t, "function foo<const T>() {}", "function foo() {\n}\n")
+	expectPrintedTS(t, "foo = function <const T>() {}", "foo = function() {\n};\n")
+	expectPrintedTS(t, "foo = function bar<const T>() {}", "foo = function bar() {\n};\n")
+	expectPrintedTS(t, "class Foo { bar<const T>() {} }", "class Foo {\n  bar() {\n  }\n}\n")
+	expectPrintedTS(t, "foo = { bar<const T>() {} }", "foo = { bar() {\n} };\n")
+	expectPrintedTS(t, "x = <const>(y)", "x = y;\n")
+	expectPrintedTS(t, "<const T>() => {}", "() => {\n};\n")
+	expectPrintedTS(t, "<const const T>() => {}", "() => {\n};\n")
+	expectPrintedTS(t, "async <const T>() => {}", "async () => {\n};\n")
+	expectPrintedTS(t, "async <const const T>() => {}", "async () => {\n};\n")
+	expectPrintedTS(t, "let x: <const T>() => T = y", "let x = y;\n")
+	expectPrintedTS(t, "let x: <const const T>() => T = y", "let x = y;\n")
+	expectPrintedTS(t, "let x: new <const T>() => T = y", "let x = y;\n")
+	expectPrintedTS(t, "let x: new <const const T>() => T = y", "let x = y;\n")
+	expectParseErrorTS(t, "type Foo<const T> = T", "<stdin>: ERROR: The modifier \"const\" is not valid here:\n")
+	expectParseErrorTS(t, "interface Foo<const T> {}", "<stdin>: ERROR: The modifier \"const\" is not valid here:\n")
+	expectParseErrorTS(t, "let x: <const>() => {}", "<stdin>: ERROR: Expected identifier but found \">\"\n")
+	expectParseErrorTS(t, "let x: new <const>() => {}", "<stdin>: ERROR: Expected identifier but found \">\"\n")
+	expectParseErrorTS(t, "let x: Foo<const T>", "<stdin>: ERROR: Expected \">\" but found \"T\"\n")
+	expectParseErrorTS(t, "x = <T,>(y)", "<stdin>: ERROR: Expected \"=>\" but found end of file\n")
+	expectParseErrorTS(t, "x = <const T>(y)", "<stdin>: ERROR: Expected \"=>\" but found end of file\n")
+	expectParseErrorTS(t, "x = <T extends X>(y)", "<stdin>: ERROR: Expected \"=>\" but found end of file\n")
+	expectParseErrorTS(t, "x = async <T,>(y)", "<stdin>: ERROR: Expected \"=>\" but found end of file\n")
+	expectParseErrorTS(t, "x = async <const T>(y)", "<stdin>: ERROR: Expected \"=>\" but found end of file\n")
+	expectParseErrorTS(t, "x = async <T extends X>(y)", "<stdin>: ERROR: Expected \"=>\" but found end of file\n")
+	expectParseErrorTS(t, "x = <const const>() => {}", "<stdin>: ERROR: Expected \">\" but found \"const\"\n")
+	expectPrintedTS(t, "class Foo<const const const T> {}", "class Foo {\n}\n")
+	expectPrintedTS(t, "class Foo<const in out T> {}", "class Foo {\n}\n")
+	expectPrintedTS(t, "class Foo<in const out T> {}", "class Foo {\n}\n")
+	expectPrintedTS(t, "class Foo<in out const T> {}", "class Foo {\n}\n")
+	expectPrintedTS(t, "class Foo<const in const out const T> {}", "class Foo {\n}\n")
+	expectParseErrorTS(t, "class Foo<in const> {}", "<stdin>: ERROR: Expected identifier but found \">\"\n")
+	expectParseErrorTS(t, "class Foo<out const> {}", "<stdin>: ERROR: Expected identifier but found \">\"\n")
+	expectParseErrorTS(t, "class Foo<in out const> {}", "<stdin>: ERROR: Expected identifier but found \">\"\n")
+	expectPrintedTSX(t, "<const>(x)</const>", "/* @__PURE__ */ React.createElement(\"const\", null, \"(x)\");\n")
+	expectPrintedTSX(t, "<const const/>", "/* @__PURE__ */ React.createElement(\"const\", { const: true });\n")
+	expectPrintedTSX(t, "<const const></const>", "/* @__PURE__ */ React.createElement(\"const\", { const: true });\n")
+	expectPrintedTSX(t, "<const T/>", "/* @__PURE__ */ React.createElement(\"const\", { T: true });\n")
+	expectPrintedTSX(t, "<const T></const>", "/* @__PURE__ */ React.createElement(\"const\", { T: true });\n")
+	expectPrintedTSX(t, "<const T>(y) = {}</const>", "/* @__PURE__ */ React.createElement(\"const\", { T: true }, \"(y) = \");\n")
+	expectPrintedTSX(t, "<const T extends/>", "/* @__PURE__ */ React.createElement(\"const\", { T: true, extends: true });\n")
+	expectPrintedTSX(t, "<const T extends></const>", "/* @__PURE__ */ React.createElement(\"const\", { T: true, extends: true });\n")
+	expectPrintedTSX(t, "<const T extends>(y) = {}</const>", "/* @__PURE__ */ React.createElement(\"const\", { T: true, extends: true }, \"(y) = \");\n")
+	expectPrintedTSX(t, "<const T,>() => {}", "() => {\n};\n")
+	expectPrintedTSX(t, "<const T, X>() => {}", "() => {\n};\n")
+	expectPrintedTSX(t, "<const T, const X>() => {}", "() => {\n};\n")
+	expectPrintedTSX(t, "<const T, const const X>() => {}", "() => {\n};\n")
+	expectPrintedTSX(t, "<const T extends X>() => {}", "() => {\n};\n")
+	expectPrintedTSX(t, "async <const T,>() => {}", "async () => {\n};\n")
+	expectPrintedTSX(t, "async <const T, X>() => {}", "async () => {\n};\n")
+	expectPrintedTSX(t, "async <const T, const X>() => {}", "async () => {\n};\n")
+	expectPrintedTSX(t, "async <const T, const const X>() => {}", "async () => {\n};\n")
+	expectPrintedTSX(t, "async <const T extends X>() => {}", "async () => {\n};\n")
+	expectParseErrorTSX(t, "<const T>() => {}", jsxErrorArrow+"<stdin>: ERROR: Unexpected end of file before a closing \"const\" tag\n<stdin>: NOTE: The opening \"const\" tag is here:\n")
+	expectParseErrorTSX(t, "<const const>() => {}", jsxErrorArrow+"<stdin>: ERROR: Unexpected end of file before a closing \"const\" tag\n<stdin>: NOTE: The opening \"const\" tag is here:\n")
+	expectParseErrorTSX(t, "<const const T,>() => {}", "<stdin>: ERROR: Expected \">\" but found \",\"\n")
+	expectParseErrorTSX(t, "<const const T extends X>() => {}", jsxErrorArrow+"<stdin>: ERROR: Unexpected end of file before a closing \"const\" tag\n<stdin>: NOTE: The opening \"const\" tag is here:\n")
+	expectParseErrorTSX(t, "async <const T>() => {}", "<stdin>: ERROR: Unexpected \"const\"\n")
+	expectParseErrorTSX(t, "async <const const>() => {}", "<stdin>: ERROR: Unexpected \"const\"\n")
+	expectParseErrorTSX(t, "async <const const T,>() => {}", "<stdin>: ERROR: Unexpected \"const\"\n")
+	expectParseErrorTSX(t, "async <const const T extends X>() => {}", "<stdin>: ERROR: Unexpected \"const\"\n")
 }
 
 func TestTSAsCast(t *testing.T) {
@@ -401,6 +472,55 @@ func TestTSAsCast(t *testing.T) {
 	expectParseErrorTS(t, "x as any = y;", "<stdin>: ERROR: Expected \";\" but found \"=\"\n")
 	expectParseErrorTS(t, "(x as any = y);", "<stdin>: ERROR: Expected \")\" but found \"=\"\n")
 	expectParseErrorTS(t, "(x = y as any(z));", "<stdin>: ERROR: Expected \")\" but found \"(\"\n")
+}
+
+func TestTSSatisfies(t *testing.T) {
+	expectPrintedTS(t, "const t1 = { a: 1 } satisfies I1;", "const t1 = { a: 1 };\n")
+	expectPrintedTS(t, "const t2 = { a: 1, b: 1 } satisfies I1;", "const t2 = { a: 1, b: 1 };\n")
+	expectPrintedTS(t, "const t3 = { } satisfies I1;", "const t3 = {};\n")
+	expectPrintedTS(t, "const t4: T1 = { a: 'a' } satisfies T1;", "const t4 = { a: \"a\" };\n")
+	expectPrintedTS(t, "const t5 = (m => m.substring(0)) satisfies T2;", "const t5 = (m) => m.substring(0);\n")
+	expectPrintedTS(t, "const t6 = [1, 2] satisfies [number, number];", "const t6 = [1, 2];\n")
+	expectPrintedTS(t, "let t7 = { a: 'test' } satisfies A;", "let t7 = { a: \"test\" };\n")
+	expectPrintedTS(t, "let t8 = { a: 'test', b: 'test' } satisfies A;", "let t8 = { a: \"test\", b: \"test\" };\n")
+	expectPrintedTS(t, "export default {} satisfies Foo;", "export default {};\n")
+	expectPrintedTS(t, "export default { a: 1 } satisfies Foo;", "export default { a: 1 };\n")
+	expectPrintedTS(t,
+		"const p = { isEven: n => n % 2 === 0, isOdd: n => n % 2 === 1 } satisfies Predicates;",
+		"const p = { isEven: (n) => n % 2 === 0, isOdd: (n) => n % 2 === 1 };\n")
+	expectPrintedTS(t,
+		"let obj: { f(s: string): void } & Record<string, unknown> = { f(s) { }, g(s) { } } satisfies { g(s: string): void } & Record<string, unknown>;",
+		"let obj = { f(s) {\n}, g(s) {\n} };\n")
+	expectPrintedTS(t,
+		"const car = { start() { }, move(d) { }, stop() { } } satisfies Movable & Record<string, unknown>;",
+		"const car = { start() {\n}, move(d) {\n}, stop() {\n} };\n",
+	)
+	expectPrintedTS(t, "var v = undefined satisfies 1;", "var v = void 0;\n")
+	expectPrintedTS(t, "const a = { x: 10 } satisfies Partial<Point2d>;", "const a = { x: 10 };\n")
+	expectPrintedTS(t,
+		"const p = { a: 0, b: \"hello\", x: 8 } satisfies Partial<Record<Keys, unknown>>;",
+		"const p = { a: 0, b: \"hello\", x: 8 };\n",
+	)
+	expectPrintedTS(t,
+		"const p = { a: 0, b: \"hello\", x: 8 } satisfies Record<Keys, unknown>;",
+		"const p = { a: 0, b: \"hello\", x: 8 };\n",
+	)
+	expectPrintedTS(t,
+		"const x2 = { m: true, s: \"false\" } satisfies Facts;",
+		"const x2 = { m: true, s: \"false\" };\n",
+	)
+	expectPrintedTS(t,
+		"export const Palette = { white: { r: 255, g: 255, b: 255 }, black: { r: 0, g: 0, d: 0 }, blue: { r: 0, g: 0, b: 255 }, } satisfies Record<string, Color>;",
+		"export const Palette = { white: { r: 255, g: 255, b: 255 }, black: { r: 0, g: 0, d: 0 }, blue: { r: 0, g: 0, b: 255 } };\n",
+	)
+	expectPrintedTS(t,
+		"const a: \"baz\" = \"foo\" satisfies \"foo\" | \"bar\";",
+		"const a = \"foo\";\n",
+	)
+	expectPrintedTS(t,
+		"const b: { xyz: \"baz\" } = { xyz: \"foo\" } satisfies { xyz: \"foo\" | \"bar\" };",
+		"const b = { xyz: \"foo\" };\n",
+	)
 }
 
 func TestTSClass(t *testing.T) {
@@ -487,9 +607,11 @@ func TestTSClass(t *testing.T) {
 
 	expectPrintedTS(t, "class Foo { foo!: number }", "class Foo {\n}\n")
 	expectPrintedTS(t, "class Foo { foo!: number = 0 }", "class Foo {\n  constructor() {\n    this.foo = 0;\n  }\n}\n")
-	expectPrintedTS(t, "class Foo { foo!(): void {} }", "class Foo {\n  foo() {\n  }\n}\n")
-	expectPrintedTS(t, "class Foo { foo!(): void; foo(): void {} }", "class Foo {\n  foo() {\n  }\n}\n")
-	expectParseErrorTS(t, "class Foo { foo!(): void foo(): void {} }", "<stdin>: ERROR: Expected \";\" but found \"foo\"\n")
+	expectParseErrorTS(t, "class Foo { foo!() {} }", "<stdin>: ERROR: Expected \";\" but found \"(\"\n")
+	expectParseErrorTS(t, "class Foo { *foo!() {} }", "<stdin>: ERROR: Expected \"(\" but found \"!\"\n")
+	expectParseErrorTS(t, "class Foo { get foo!() {} }", "<stdin>: ERROR: Expected \"(\" but found \"!\"\n")
+	expectParseErrorTS(t, "class Foo { set foo!(x) {} }", "<stdin>: ERROR: Expected \"(\" but found \"!\"\n")
+	expectParseErrorTS(t, "class Foo { async foo!() {} }", "<stdin>: ERROR: Expected \"(\" but found \"!\"\n")
 
 	expectPrintedTS(t, "class Foo { 'foo' = 0 }", "class Foo {\n  constructor() {\n    this[\"foo\"] = 0;\n  }\n}\n")
 	expectPrintedTS(t, "class Foo { ['foo'] = 0 }", "class Foo {\n  constructor() {\n    this[\"foo\"] = 0;\n  }\n}\n")
@@ -551,6 +673,17 @@ func TestTSClass(t *testing.T) {
 	expectParseErrorTS(t, "class Foo<> {}", "<stdin>: ERROR: Expected identifier but found \">\"\n")
 	expectParseErrorTS(t, "class Foo<,> {}", "<stdin>: ERROR: Expected identifier but found \",\"\n")
 	expectParseErrorTS(t, "class Foo<T><T> {}", "<stdin>: ERROR: Expected \"{\" but found \"<\"\n")
+
+	expectPrintedTS(t, "class Foo { foo<T>() {} }", "class Foo {\n  foo() {\n  }\n}\n")
+	expectPrintedTS(t, "class Foo { foo?<T>() {} }", "class Foo {\n  foo() {\n  }\n}\n")
+	expectPrintedTS(t, "class Foo { [foo]<T>() {} }", "class Foo {\n  [foo]() {\n  }\n}\n")
+	expectPrintedTS(t, "class Foo { [foo]?<T>() {} }", "class Foo {\n  [foo]() {\n  }\n}\n")
+	expectParseErrorTS(t, "class Foo { foo<T> }", "<stdin>: ERROR: Expected \"(\" but found \"}\"\n")
+	expectParseErrorTS(t, "class Foo { foo?<T> }", "<stdin>: ERROR: Expected \"(\" but found \"}\"\n")
+	expectParseErrorTS(t, "class Foo { foo!<T>() {} }", "<stdin>: ERROR: Expected \";\" but found \"<\"\n")
+	expectParseErrorTS(t, "class Foo { [foo]<T> }", "<stdin>: ERROR: Expected \"(\" but found \"}\"\n")
+	expectParseErrorTS(t, "class Foo { [foo]?<T> }", "<stdin>: ERROR: Expected \"(\" but found \"}\"\n")
+	expectParseErrorTS(t, "class Foo { [foo]!<T>() {} }", "<stdin>: ERROR: Expected \";\" but found \"<\"\n")
 }
 
 func TestTSPrivateIdentifiers(t *testing.T) {
@@ -739,8 +872,7 @@ export let x;
 	expectParseErrorTS(t, "namespace foo { 0 } function* foo() {}", errorText)
 	expectParseErrorTS(t, "namespace foo { 0 } async function foo() {}", errorText)
 	expectParseErrorTS(t, "namespace foo { 0 } class foo {}", errorText)
-	expectPrintedTS(t, "namespace foo { 0 } enum foo { a }", `var foo;
-((foo) => {
+	expectPrintedTS(t, "namespace foo { 0 } enum foo { a }", `((foo) => {
   0;
 })(foo || (foo = {}));
 var foo = /* @__PURE__ */ ((foo) => {
@@ -1297,6 +1429,15 @@ y = [0 /* A */, Foo?.["A"], Foo?.["A"]()];
 	expectParseErrorTS(t, "export enum x { yield = 1, y = yield }",
 		"<stdin>: ERROR: \"yield\" is a reserved word and cannot be used in an ECMAScript module\n"+
 			"<stdin>: NOTE: This file is considered to be an ECMAScript module because of the \"export\" keyword here:\n")
+
+	// Check enum use before declaration
+	expectPrintedTS(t, "foo = Foo.FOO; enum Foo { FOO } bar = Foo.FOO", `foo = 0 /* FOO */;
+var Foo = /* @__PURE__ */ ((Foo) => {
+  Foo[Foo["FOO"] = 0] = "FOO";
+  return Foo;
+})(Foo || {});
+bar = 0 /* FOO */;
+`)
 }
 
 func TestTSEnumConstantFolding(t *testing.T) {
@@ -1877,6 +2018,12 @@ func TestTSInstantiationExpression(t *testing.T) {
 	// Instantiation expression
 	expectPrintedTS(t, "const x1 = f<true>;\n(true);", "const x1 = f;\ntrue;\n")
 
+	// Trailing commas are not allowed
+	expectPrintedTS(t, "const x = Array<number>\n(0);", "const x = Array(0);\n")
+	expectPrintedTS(t, "const x = Array<number>;\n(0);", "const x = Array;\n0;\n")
+	expectParseErrorTS(t, "const x = Array<number,>\n(0);", "<stdin>: ERROR: Expected identifier but found \">\"\n")
+	expectParseErrorTS(t, "const x = Array<number,>;\n(0);", "<stdin>: ERROR: Expected identifier but found \">\"\n")
+
 	expectPrintedTS(t, "f<number>?.();", "f?.();\n")
 	expectPrintedTS(t, "f?.<number>();", "f?.();\n")
 	expectPrintedTS(t, "f<<T>() => T>?.();", "f?.();\n")
@@ -1930,9 +2077,9 @@ func TestTSInstantiationExpression(t *testing.T) {
 	expectPrintedTS(t, "interface Foo { \n (a: number): typeof a \n <T>(): void \n }", "")
 	expectPrintedTSX(t, "interface Foo { \n (a: number): typeof a \n <T>(): void \n }", "")
 	expectParseErrorTS(t, "type x = y\n<number>\nz\n</number>", "<stdin>: ERROR: Unterminated regular expression\n")
-	expectParseErrorTSX(t, "type x = y\n<number>\nz", "<stdin>: ERROR: Unexpected end of file\n")
+	expectParseErrorTSX(t, "type x = y\n<number>\nz", "<stdin>: ERROR: Unexpected end of file before a closing \"number\" tag\n<stdin>: NOTE: The opening \"number\" tag is here:\n")
 	expectParseErrorTS(t, "type x = typeof y\n<number>\nz\n</number>", "<stdin>: ERROR: Unterminated regular expression\n")
-	expectParseErrorTSX(t, "type x = typeof y\n<number>\nz", "<stdin>: ERROR: Unexpected end of file\n")
+	expectParseErrorTSX(t, "type x = typeof y\n<number>\nz", "<stdin>: ERROR: Unexpected end of file before a closing \"number\" tag\n<stdin>: NOTE: The opening \"number\" tag is here:\n")
 
 	// See: https://github.com/microsoft/TypeScript/issues/48654
 	expectPrintedTS(t, "x<true>\ny", "x < true > y;\n")
@@ -2243,14 +2390,14 @@ func TestTSJSX(t *testing.T) {
 
 	expectPrintedTS(t, "const x = <number>1", "const x = 1;\n")
 	expectPrintedTSX(t, "const x = <number>1</number>", "const x = /* @__PURE__ */ React.createElement(\"number\", null, \"1\");\n")
-	expectParseErrorTSX(t, "const x = <number>1", "<stdin>: ERROR: Unexpected end of file\n")
+	expectParseErrorTSX(t, "const x = <number>1", "<stdin>: ERROR: Unexpected end of file before a closing \"number\" tag\n<stdin>: NOTE: The opening \"number\" tag is here:\n")
 
 	expectPrintedTSX(t, "<x>a{}c</x>", "/* @__PURE__ */ React.createElement(\"x\", null, \"a\", \"c\");\n")
 	expectPrintedTSX(t, "<x>a{b}c</x>", "/* @__PURE__ */ React.createElement(\"x\", null, \"a\", b, \"c\");\n")
 	expectPrintedTSX(t, "<x>a{...b}c</x>", "/* @__PURE__ */ React.createElement(\"x\", null, \"a\", ...b, \"c\");\n")
 
 	expectPrintedTSX(t, "const x = <Foo<T>></Foo>", "const x = /* @__PURE__ */ React.createElement(Foo, null);\n")
-	expectPrintedTSX(t, "const x = <Foo<T> data-foo></Foo>", "const x = /* @__PURE__ */ React.createElement(Foo, {\n  \"data-foo\": true\n});\n")
+	expectPrintedTSX(t, "const x = <Foo<T> data-foo></Foo>", "const x = /* @__PURE__ */ React.createElement(Foo, { \"data-foo\": true });\n")
 	expectParseErrorTSX(t, "const x = <Foo<T>=>", "<stdin>: ERROR: Expected \">\" but found \"=>\"\n")
 
 	expectPrintedTS(t, "const x = <T>() => {}", "const x = () => {\n};\n")
@@ -2277,6 +2424,9 @@ func TestTSJSX(t *testing.T) {
 	expectPrintedTS(t, "const x = async <T extends X>(y, z) => {}", "const x = async (y, z) => {\n};\n")
 	expectPrintedTS(t, "const x = async <T extends X = Y>(y: T) => {}", "const x = async (y) => {\n};\n")
 	expectPrintedTS(t, "const x = async <T extends X = Y>(y, z) => {}", "const x = async (y, z) => {\n};\n")
+	expectPrintedTS(t, "const x = (async <T, X> y)", "const x = (async < T, X > y);\n")
+	expectPrintedTS(t, "const x = (async <T, X>(y))", "const x = async(y);\n")
+	expectParseErrorTS(t, "const x = async <T,>(y)", "<stdin>: ERROR: Expected \"=>\" but found end of file\n")
 	expectParseErrorTS(t, "const x = async <T>(y: T)", "<stdin>: ERROR: Unexpected \":\"\n")
 	expectParseErrorTS(t, "const x = async\n<T>() => {}", "<stdin>: ERROR: Expected \";\" but found \"=>\"\n")
 	expectParseErrorTS(t, "const x = async\n<T>(x) => {}", "<stdin>: ERROR: Expected \";\" but found \"=>\"\n")
@@ -2295,6 +2445,10 @@ func TestTSJSX(t *testing.T) {
 	invalidWithHint := "<stdin>: ERROR: The character \">\" is not valid inside a JSX element\n<stdin>: NOTE: TypeScript's TSX syntax interprets " +
 		"arrow functions with a single generic type parameter as an opening JSX element. If you want it to be interpreted as an arrow function instead, " +
 		"you need to add a trailing comma after the type parameter to disambiguate:\n"
+	expectPrintedTSX(t, "<T extends/>", "/* @__PURE__ */ React.createElement(T, { extends: true });\n")
+	expectPrintedTSX(t, "<T extends>(y) = {}</T>", "/* @__PURE__ */ React.createElement(T, { extends: true }, \"(y) = \");\n")
+	expectParseErrorTSX(t, "<T extends X/>", "<stdin>: ERROR: Expected \">\" but found \"/\"\n")
+	expectParseErrorTSX(t, "<T extends X>(y) = {}</T>", "<stdin>: ERROR: Expected \"=>\" but found \"=\"\n")
 	expectParseErrorTSX(t, "(<T>(y) => {}</T>)", invalidWithHint)
 	expectParseErrorTSX(t, "(<T>(x: X<Y>) => {}</Y></T>)", invalidWithHint)
 	expectParseErrorTSX(t, "(<T extends>(y) => {}</T>)", invalid)
@@ -2305,14 +2459,21 @@ func TestTSJSX(t *testing.T) {
 	expectPrintedTSX(t, "(<T,>() => {})", "() => {\n};\n")
 	expectPrintedTSX(t, "(<T, X>(y) => {})", "(y) => {\n};\n")
 	expectPrintedTSX(t, "(<T, X>(y): (() => {}) => {})", "(y) => {\n};\n")
-	expectParseErrorTSX(t, "(<T>() => {})", invalidWithHint+"<stdin>: ERROR: Unexpected end of file\n")
-	expectParseErrorTSX(t, "(<T>(x: X<Y>) => {})", invalidWithHint+"<stdin>: ERROR: Unexpected end of file\n")
-	expectParseErrorTSX(t, "(<T>(x: X<Y>) => {})</Y>", invalidWithHint+"<stdin>: ERROR: Unexpected end of file\n")
+	expectParseErrorTSX(t, "(<T>() => {})", invalidWithHint+"<stdin>: ERROR: Unexpected end of file before a closing \"T\" tag\n<stdin>: NOTE: The opening \"T\" tag is here:\n")
+	expectParseErrorTSX(t, "(<T>(x: X<Y>) => {})", invalidWithHint+"<stdin>: ERROR: Unexpected end of file before a closing \"Y\" tag\n<stdin>: NOTE: The opening \"Y\" tag is here:\n")
+	expectParseErrorTSX(t, "(<T>(x: X<Y>) => {})</Y>", invalidWithHint+"<stdin>: ERROR: Unexpected end of file before a closing \"T\" tag\n<stdin>: NOTE: The opening \"T\" tag is here:\n")
 	expectParseErrorTSX(t, "(<[]>(y))", "<stdin>: ERROR: Expected identifier but found \"[\"\n")
 	expectParseErrorTSX(t, "(<T[]>(y))", "<stdin>: ERROR: Expected \">\" but found \"[\"\n")
 	expectParseErrorTSX(t, "(<T = X>(y))", "<stdin>: ERROR: Expected \"=>\" but found \")\"\n")
 	expectParseErrorTSX(t, "(<T, X>(y))", "<stdin>: ERROR: Expected \"=>\" but found \")\"\n")
 	expectParseErrorTSX(t, "(<T, X>y => {})", "<stdin>: ERROR: Expected \"(\" but found \"y\"\n")
+
+	// TypeScript doesn't currently parse these even though it seems unambiguous
+	expectPrintedTSX(t, "async <T,>() => {}", "async () => {\n};\n")
+	expectPrintedTSX(t, "async <T extends X>() => {}", "async () => {\n};\n")
+	expectPrintedTSX(t, "async <T>()", "async();\n")
+	expectParseErrorTSX(t, "async <T>() => {}", "<stdin>: ERROR: Expected \";\" but found \"=>\"\n")
+	expectParseErrorTSX(t, "async <T extends>() => {}", "<stdin>: ERROR: Expected \";\" but found \"extends\"\n")
 }
 
 func TestTSNoAmbiguousLessThan(t *testing.T) {

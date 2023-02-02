@@ -16,11 +16,8 @@ import (
 var helpText = func(colors logger.Colors) string {
 	// Read "NO_COLOR" from the environment. This is a convention that some
 	// software follows. See https://no-color.org/ for more information.
-	for _, key := range os.Environ() {
-		if strings.HasPrefix(key, "NO_COLOR=") {
-			colors = logger.Colors{}
-			break
-		}
+	if _, ok := os.LookupEnv("NO_COLOR"); ok {
+		colors = logger.Colors{}
 	}
 
 	return `
@@ -41,11 +38,12 @@ var helpText = func(colors logger.Colors) string {
                         bundling, otherwise default is iife when platform
                         is browser and cjs when platform is node)
   --loader:X=L          Use loader L to load file extension X, where L is
-                        one of: js | jsx | ts | tsx | css | json | text |
-                        base64 | file | dataurl | binary | copy
+                        one of: base64 | binary | copy | css | dataurl |
+                        empty | file | js | json | jsx | text | ts | tsx
   --minify              Minify the output (sets all --minify-* flags)
   --outdir=...          The output directory (for multiple entry points)
   --outfile=...         The output file (for one entry point)
+  --packages=...        Set to "external" to avoid bundling any package
   --platform=...        Platform target (browser | node | neutral,
                         default browser)
   --serve=...           Start a local HTTP server on this host:port for outputs
@@ -63,6 +61,7 @@ var helpText = func(colors logger.Colors) string {
                             (default "[name]-[hash]")
   --banner:T=...            Text to be prepended to each output file of type T
                             where T is one of: css | js
+  --certfile=...            Certificate for serving HTTPS (see also "--keyfile")
   --charset=utf8            Do not escape UTF-8 code points
   --chunk-names=...         Path template to use for code splitting chunks
                             (default "[name]-[hash]")
@@ -86,6 +85,7 @@ var helpText = func(colors logger.Colors) string {
   --jsx=...                 Set to "automatic" to use React's automatic runtime
                             or to "preserve" to disable transforming JSX to JS
   --keep-names              Preserve "name" on functions and classes
+  --keyfile=...             Key for serving HTTPS (see also "--certfile")
   --legal-comments=...      Where to place legal comments (none | inline |
                             eof | linked | external, default eof when bundling
                             and inline otherwise)
@@ -100,6 +100,7 @@ var helpText = func(colors logger.Colors) string {
   --mangle-props=...        Rename all properties matching a regular expression
   --mangle-quoted=...       Enable renaming of quoted properties (true | false)
   --metafile=...            Write metadata about the build to a JSON file
+                            (see also: ` + colors.Underline + `https://esbuild.github.io/analyze/` + colors.Reset + `)
   --minify-whitespace       Remove whitespace in output files
   --minify-identifiers      Shorten identifiers in output files
   --minify-syntax           Use equivalent but shorter syntax in output files
@@ -285,21 +286,26 @@ func main() {
 				exitCode = cli.Run(osArgs)
 			}
 		} else {
-			// Don't disable the GC if this is a long-running process
 			isServeOrWatch := false
+			nonFlagCount := 0
 			for _, arg := range osArgs {
-				if arg == "--serve" || arg == "--watch" || strings.HasPrefix(arg, "--serve=") {
+				if !strings.HasPrefix(arg, "-") {
+					nonFlagCount++
+				} else if arg == "--serve" || arg == "--watch" || strings.HasPrefix(arg, "--serve=") {
 					isServeOrWatch = true
-					break
 				}
 			}
 
 			if !isServeOrWatch {
-				// Disable the GC since we're just going to allocate a bunch of memory
-				// and then exit anyway. This speedup is not insignificant. Make sure to
-				// only do this here once we know that we're not going to be a long-lived
-				// process though.
-				debug.SetGCPercent(-1)
+				// If this is not a long-running process and there is at most a single
+				// entry point, then disable the GC since we're just going to allocate
+				// a bunch of memory and then exit anyway. This speedup is not
+				// insignificant. We don't do this when there are multiple entry points
+				// since otherwise esbuild could unnecessarily use much more memory
+				// than it might otherwise need to process many entry points.
+				if nonFlagCount <= 1 {
+					debug.SetGCPercent(-1)
+				}
 			} else if !isStdinTTY && !isWatchForever {
 				// If stdin isn't a TTY, watch stdin and abort in case it is closed.
 				// This is necessary when the esbuild binary executable is invoked via
